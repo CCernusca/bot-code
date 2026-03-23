@@ -207,4 +207,4 @@ marimo/_lsp/
 __marimo__/
 
 # Robus core (is its own repo)
-robus-core/
+robus_core/
