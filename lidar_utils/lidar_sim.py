@@ -4,15 +4,21 @@ import time
 
 SIM_QUALITY = 15  # Simulated quality value passed to on_update
 
-def read_lidar_data(on_update, width=1.0, length=2.0, step_size=1, proximity=0.1):
+def read_lidar_data(on_update, on_ready=None, width=1.0, length=2.0, step_size=1, proximity=0.1, robot_radius=0.1):
     """
     Simulates RPLidar C1 sensor data continuously.
     Calls on_update(angle, distance, quality) for each measurement.
+    Calls on_ready(px, py, angle_f) once before the loop starts, if provided.
     Distances are in millimeters, matching the real sensor format.
     Stops on KeyboardInterrupt.
     """
     print("Starting simulated scan...")
-    _, _, _, _, _, _, results = get_boundary_distances(width, length, step_size, proximity)
+    px, py, angle_f, _, _, obstacles, results = get_boundary_distances(width, length, step_size, proximity, robot_radius)
+    print(f"  Robot position : ({px:.3f}, {py:.3f}) m")
+    print(f"  Sensor heading : {angle_f:.1f}°")
+    print(f"  Obstacles      : {[(round(ox, 3), round(oy, 3)) for ox, oy in obstacles]}")
+    if on_ready:
+        on_ready(px, py, angle_f)
     scan = [(angle, int(dist_m * 1000)) for angle, dist_m in results if 0 < int(dist_m * 1000) < 12000]
     try:
         while True:
@@ -23,17 +29,23 @@ def read_lidar_data(on_update, width=1.0, length=2.0, step_size=1, proximity=0.1
         print("\nStopping simulation...")
 
 
-def get_boundary_distances(width=1.0, length=2.0, step_size=1, proximity=0.1):
-    # 1. Random source point and orientation
-    px, py = random.uniform(0, width), random.uniform(0, length)
+def get_boundary_distances(width=1.0, length=2.0, step_size=1, proximity=0.1, robot_radius=0.1):
+    # 1. Random source point and orientation (kept away from walls by robot_radius)
+    px, py = random.uniform(robot_radius, width - robot_radius), random.uniform(robot_radius, length - robot_radius)
     angle_f = random.uniform(0, 360)
     
-    # 2. Generate 3 random obstacle points
+    # 2. Generate 3 random obstacle points, each respecting wall, robot and
+    #    inter-obstacle clearance (using proximity as the obstacle radius).
     obstacles = []
     for _ in range(3):
-        ox = random.uniform(0.1, width - 0.1)
-        oy = random.uniform(0.1, length - 0.1)
-        obstacles.append((ox, oy))
+        for _ in range(1000):
+            ox = random.uniform(proximity, width  - proximity)
+            oy = random.uniform(proximity, length - proximity)
+            too_close_to_robot = math.hypot(ox - px, oy - py) < robot_radius + proximity
+            too_close_to_other = any(math.hypot(ox - ex, oy - ey) < 2 * proximity for ex, ey in obstacles)
+            if not too_close_to_robot and not too_close_to_other:
+                obstacles.append((ox, oy))
+                break
     
     results = []
     

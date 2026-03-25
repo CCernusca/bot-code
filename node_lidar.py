@@ -38,6 +38,10 @@ if __name__ == "__main__":
     except SensorUnavailableError:
         if SIM_REPLACE:
             print("Falling back to simulated sensor data.")
-            lidar_sim.read_lidar_data(on_measurement)
+
+            def _on_sim_ready(px, py, angle_f):
+                mb.set("sim_heading", str(round(angle_f, 1)))
+
+            lidar_sim.read_lidar_data(on_measurement, on_ready=_on_sim_ready)
         else:
             raise
