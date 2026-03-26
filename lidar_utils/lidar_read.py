@@ -41,7 +41,7 @@ def parse_packet(raw: bytes):
     distance  = int(dist_raw / 4.0)   # C1 uses quarter-millimetres
 
     # 128 is a sentinel for invalid distance; quality < 30 is unreliable
-    if quality >= 30 and 0.0 <= angle <= 360.0 and 150 <= distance <= 12000 and distance != 128:
+    if quality >= 30 and 0.0 <= angle <= 360.0 and 50 <= distance <= 12000 and distance != 128:
         return angle, distance, quality
     return None
 

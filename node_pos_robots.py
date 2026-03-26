@@ -1,5 +1,4 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
-from collections import deque
 import json
 import math
 
@@ -47,20 +46,6 @@ def _effective_field_angle():
 
 # ── Coordinate conversion ─────────────────────────────────────────────────────
 
-def _lidar_to_field():
-    """Convert all lidar measurements to (x, y) in field coordinates."""
-    if not _lidar or _robot_pos is None:
-        return []
-    rx, ry = _robot_pos
-    fa_rad = math.radians(_effective_field_angle())
-    pts = []
-    for angle_deg, dist_mm in _lidar.items():
-        d = dist_mm / 1000.0
-        a = math.radians(angle_deg) + fa_rad
-        pts.append((rx + d * math.cos(a), ry + d * math.sin(a)))
-    return pts
-
-
 def _is_wall_hit(x, y):
     """True if the point is close enough to a field boundary to be a wall hit."""
     return (
@@ -73,35 +58,40 @@ def _inside_field(x, y):
     return 0 <= x <= FIELD_WIDTH and 0 <= y <= FIELD_HEIGHT
 
 
-# ── Clustering ────────────────────────────────────────────────────────────────
+# ── Angular-continuity clustering ─────────────────────────────────────────────
 
-def _cluster(points):
+def _cluster_contiguous(sorted_scan):
     """
-    Greedy flood-fill: each unvisited point seeds a new cluster; all reachable
-    points within CLUSTER_DIST (transitively) join it.  Returns a list of
-    point-lists.
+    Cluster lidar points by angular continuity.
+
+    sorted_scan: [(angle_deg, x, y, is_interior), ...] sorted by sensor angle.
+
+    A cluster is broken whenever:
+      - a non-interior point (wall hit or out-of-field) is encountered, OR
+      - the Cartesian gap to the previous interior point exceeds CLUSTER_DIST.
+
+    Returns a list of [(x, y)] clusters.
     """
-    n = len(points)
-    assigned = [False] * n
     clusters = []
+    current  = []
 
-    for i in range(n):
-        if assigned[i]:
-            continue
-        cluster = [i]
-        assigned[i] = True
-        queue = deque([i])
-        while queue:
-            curr = queue.popleft()
-            cx, cy = points[curr]
-            for j in range(n):
-                if not assigned[j]:
-                    jx, jy = points[j]
-                    if math.hypot(cx - jx, cy - jy) <= CLUSTER_DIST:
-                        assigned[j] = True
-                        cluster.append(j)
-                        queue.append(j)
-        clusters.append([points[idx] for idx in cluster])
+    for _, x, y, is_interior in sorted_scan:
+        if not is_interior:
+            # Wall hit / out-of-field — end the current run
+            if current:
+                clusters.append(current)
+                current = []
+        else:
+            if current:
+                lx, ly = current[-1]
+                if math.hypot(x - lx, y - ly) > CLUSTER_DIST:
+                    # Spatial gap too large — start a fresh cluster
+                    clusters.append(current)
+                    current = []
+            current.append((x, y))
+
+    if current:
+        clusters.append(current)
 
     return clusters
 
@@ -162,23 +152,31 @@ def _detect_robots():
     if not _lidar or _robot_pos is None:
         return []
 
-    all_pts = _lidar_to_field()
+    rx, ry   = _robot_pos
+    fa_rad   = math.radians(_effective_field_angle())
 
-    interior = [
-        (x, y) for x, y in all_pts
-        if _inside_field(x, y) and not _is_wall_hit(x, y)
+    # Build angularly-sorted scan with field coordinates and interior flag
+    sorted_scan = []
+    for angle_deg in sorted(_lidar):
+        dist_mm = _lidar[angle_deg]
+        d = dist_mm / 1000.0
+        a = math.radians(angle_deg) + fa_rad
+        x = rx + d * math.cos(a)
+        y = ry + d * math.sin(a)
+        interior = _inside_field(x, y) and not _is_wall_hit(x, y)
+        sorted_scan.append((angle_deg, x, y, interior))
+
+    clusters = [
+        c for c in _cluster_contiguous(sorted_scan)
+        if len(c) >= MIN_CLUSTER_SIZE
     ]
-
-    if not interior:
-        return []
-
-    clusters = [c for c in _cluster(interior) if len(c) >= MIN_CLUSTER_SIZE]
 
     robots = []
     for cluster in clusters:
         ox, oy, method = _fit_center(cluster)
         print(f"  [ROBOTS] {len(cluster):2d} pts → ({ox:.3f}, {oy:.3f})  [{method}]")
-        robots.append({"x": round(ox, 3), "y": round(oy, 3), "pts": len(cluster)})
+        robots.append({"x": round(ox, 3), "y": round(oy, 3),
+                       "pts": len(cluster), "method": method})
 
     return robots
 

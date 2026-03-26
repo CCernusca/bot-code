@@ -23,7 +23,8 @@ def read_lidar_data(on_update, on_ready=None, width=1.0, length=2.0, step_size=1
     scan = [
         (angle, int(dist_m * 1000 + random.gauss(0, SIM_JITTER_MM)))
         for angle, dist_m in results
-        if 150 <= int(dist_m * 1000) <= 12000
+        # Blind range = 5cm, Max range = 12m
+        if 50 <= int(dist_m * 1000) <= 12000
     ]
     try:
         while True:
