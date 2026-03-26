@@ -3,7 +3,7 @@ import random
 import time
 
 SIM_QUALITY  = 15   # Simulated quality value passed to on_update
-SIM_JITTER_MM = 0   # Gaussian noise (std dev, mm) added to each distance reading
+SIM_JITTER_MM = 8   # Gaussian noise (std dev, mm) added to each distance reading
 
 def read_lidar_data(on_update, on_ready=None, width=1.82, length=2.43, step_size=1, proximity=0.1, robot_radius=0.09):
     """

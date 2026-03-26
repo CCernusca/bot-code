@@ -1,6 +1,7 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 import json
 import math
+import numpy as np
 
 # ── Line-detection parameters ─────────────────────────────────────────────────
 LINE_TOL       = 0.02   # metres — max gap between adjacent sorted values to stay
@@ -9,6 +10,11 @@ WALL_THICKNESS = 0.05   # metres — max total spread of a cluster in the normal
                         #          direction; rejects curved/scattered surfaces
 MIN_POINTS     = 20     # minimum lidar points for a cluster to be accepted
 MIN_SPAN       = 0.1   # metres — minimum extent along the wall axis
+
+# ── Histogram-based detection parameters ─────────────────────────────────────
+HIST_BINS         = 250   # histogram resolution
+HIST_MIN_COUNTS   = 8     # minimum bin count to qualify as a wall peak
+HIST_MIN_PEAK_SEP = 0.15  # metres — minimum separation between two peaks on the same axis
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb = TelemetryBroker()
@@ -93,6 +99,50 @@ def _detect_walls(pts):
     return walls
 
 
+def _detect_walls_histogram(pts_field_aligned):
+    """
+    Histogram-based wall detection.
+
+    pts_field_aligned: list of (x, y) in field-aligned robot-centred metres
+                       (same coordinate system as _detect_walls).
+
+    Builds a 1-D histogram along each axis and extracts the two strongest
+    peaks, which correspond to the two opposing walls in that direction.
+    Returns wall dicts in the same format as _detect_walls.
+    """
+    if len(pts_field_aligned) < MIN_POINTS:
+        return []
+
+    pts = np.array(pts_field_aligned, dtype=float)
+    walls = []
+
+    for axis, gradient in [(0, None), (1, 0)]:
+        data = pts[:, axis]
+        counts, bin_edges = np.histogram(data, bins=HIST_BINS)
+        centres = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+        # Peak 1: highest bin
+        i1 = int(np.argmax(counts))
+        if counts[i1] < HIST_MIN_COUNTS:
+            continue
+        p1 = float(centres[i1])
+
+        # Peak 2: highest bin at least HIST_MIN_PEAK_SEP away from peak 1
+        masked = counts.copy()
+        masked[np.abs(centres - p1) < HIST_MIN_PEAK_SEP] = 0
+        i2 = int(np.argmax(masked))
+        if masked[i2] < HIST_MIN_COUNTS:
+            continue
+        p2 = float(centres[i2])
+
+        label = "Vertical" if gradient is None else "Horizontal"
+        print(f"  [WALLS-H] {label}  peaks={p1:+.3f}, {p2:+.3f} m")
+        walls.append({"gradient": gradient, "offset": round(p1, 3)})
+        walls.append({"gradient": gradient, "offset": round(p2, 3)})
+
+    return walls
+
+
 def on_update(key, value):
     global _lidar, _field_angle, _sim_heading
 
@@ -140,6 +190,10 @@ def on_update(key, value):
         walls = _detect_walls(pts)
         print(f"  [WALLS] {len(walls)} wall(s) detected")
         mb.set("lidar_walls", json.dumps(walls))
+
+        walls_hist = _detect_walls_histogram(pts)
+        print(f"  [WALLS-H] {len(walls_hist)} wall(s) detected")
+        mb.set("lidar_walls_hist", json.dumps(walls_hist))
 
 
 if __name__ == "__main__":

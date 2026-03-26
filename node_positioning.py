@@ -27,8 +27,9 @@ mb = TelemetryBroker()
 # State updated by broker callbacks
 _field_angle   = None  # degrees — explicitly set field angle; None = not set
 _sim_heading   = None  # degrees — angle_f from lidar simulation, used as fallback
-_depth_corners = []    # [(angle_deg, dist_mm), ...]  sensor polar frame
-_wall_corners  = []    # [[x, y], ...]  robot-centred field-aligned metres
+_depth_corners      = []    # [(angle_deg, dist_mm), ...]  sensor polar frame
+_wall_corners       = []    # [[x, y], ...]  robot-centred field-aligned metres
+_wall_corners_hist  = []    # [[x, y], ...]  from histogram wall detection
 
 
 def _effective_field_angle():
@@ -52,7 +53,7 @@ def _compute_position():
     positions are scored by support (other candidates within _OUTLIER_THRESHOLD)
     and the best-supported one is returned.  Ties break on sensor distance.
     """
-    if not _depth_corners and not _wall_corners:
+    if not _depth_corners and not _wall_corners and not _wall_corners_hist:
         return None
 
     eff_angle = _effective_field_angle()
@@ -61,7 +62,8 @@ def _compute_position():
                  else "sim_heading" if _sim_heading is not None
                  else "default")
     print(f"[POS] field_angle={eff_angle:.1f}° (from {source})"
-          f"  depth={len(_depth_corners)}  wall={len(_wall_corners)}")
+          f"  depth={len(_depth_corners)}  wall={len(_wall_corners)}"
+          f"  wall_hist={len(_wall_corners_hist)}")
 
     # ── Build unified displacement list ───────────────────────────────────────
     # Each entry: (dx, dy, label, dist_mm)
@@ -80,6 +82,11 @@ def _compute_position():
         dist_mm = math.hypot(wx, wy) * 1000
         print(f"  wall  #{i}  offset=({wx:.3f}, {wy:.3f}) m  dist={dist_mm:.0f} mm")
         displacements.append((wx, wy, f"wall#{i}", dist_mm))
+
+    for i, (wx, wy) in enumerate(_wall_corners_hist):
+        dist_mm = math.hypot(wx, wy) * 1000
+        print(f"  wallH #{i}  offset=({wx:.3f}, {wy:.3f}) m  dist={dist_mm:.0f} mm")
+        displacements.append((wx, wy, f"wallH#{i}", dist_mm))
 
     # ── Generate candidates ───────────────────────────────────────────────────
     # (rx, ry, label, field_corner_xy, dist_mm)
@@ -127,7 +134,7 @@ def _compute_position():
 
 
 def on_update(key, value):
-    global _field_angle, _sim_heading, _depth_corners, _wall_corners
+    global _field_angle, _sim_heading, _depth_corners, _wall_corners, _wall_corners_hist
 
     if value is None:
         return
@@ -158,6 +165,12 @@ def on_update(key, value):
         except (json.JSONDecodeError, TypeError):
             return
 
+    elif key == "wall_corners_hist":
+        try:
+            _wall_corners_hist = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return
+
     pos = _compute_position()
     if pos is not None:
         mb.set("robot_position", json.dumps({"x": pos[0], "y": pos[1]}))
@@ -178,7 +191,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    mb.setcallback(["field_angle", "sim_heading", "depth_corners", "wall_corners"], on_update)
+    mb.setcallback(["field_angle", "sim_heading", "depth_corners", "wall_corners", "wall_corners_hist"], on_update)
     try:
         mb.receiver_loop()
     except KeyboardInterrupt:

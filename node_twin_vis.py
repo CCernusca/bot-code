@@ -21,8 +21,10 @@ _sim_heading  = None  # float | None
 _robot_pos    = None  # (x, y) metres, field frame
 _other_robots = []    # [[x, y], ...]  field frame
 _corners      = []    # [[angle_deg, dist_mm], ...]  sensor frame
-_wall_corners       = []   # [[x, y], ...]  robot-centred field-aligned metres
-_walls              = []   # [{"gradient": 0|None, "offset": float}]  field frame
+_wall_corners       = []   # [[x, y], ...]  robot-centred field-aligned metres (primary)
+_wall_corners_hist  = []   # [[x, y], ...]  robot-centred field-aligned metres (histogram)
+_walls              = []   # [{"gradient": 0|None, "offset": float}]  robot-centred
+_walls_hist         = []   # same format, from histogram detection
 _positioning_corner = None # {"dx": float, "dy": float}  robot-centred field-aligned
 
 _state_lock    = threading.Lock()
@@ -78,16 +80,22 @@ def _redraw():
     else:
         arrow_origin = None
 
-    # ── Detected walls ────────────────────────────────────────────────────────
+    # ── Detected walls (primary — clustering) ─────────────────────────────────
     # Wall offsets are robot-centred; shift into field coordinates.
     for wall in _walls:
         off = wall["offset"]
-        if wall["gradient"] == 0:          # horizontal: field_y = robot_y + offset
-            field_off = origin[1] + off
-            ax.axhline(field_off, color='steelblue', lw=1.5, ls='--', zorder=4)
-        else:                              # vertical:   field_x = robot_x + offset
-            field_off = origin[0] + off
-            ax.axvline(field_off, color='steelblue', lw=1.5, ls='--', zorder=4)
+        if wall["gradient"] == 0:
+            ax.axhline(origin[1] + off, color='steelblue', lw=1.5, ls='--', zorder=4)
+        else:
+            ax.axvline(origin[0] + off, color='steelblue', lw=1.5, ls='--', zorder=4)
+
+    # ── Detected walls (secondary — histogram) ────────────────────────────────
+    for wall in _walls_hist:
+        off = wall["offset"]
+        if wall["gradient"] == 0:
+            ax.axhline(origin[1] + off, color='mediumpurple', lw=1.5, ls=':', zorder=4)
+        else:
+            ax.axvline(origin[0] + off, color='mediumpurple', lw=1.5, ls=':', zorder=4)
 
     if known_pos:
         # ── Field boundary ────────────────────────────────────────────────────
@@ -140,12 +148,19 @@ def _redraw():
                    s=140, marker='X', c='red', edgecolors='black',
                    linewidths=0.8, zorder=6, label='Depth corners')
 
-    # ── Wall corners (robot-centred field-aligned → field frame) ──────────────
+    # ── Wall corners — primary (robot-centred field-aligned → field frame) ─────
     if _wall_corners:
         wcpts = np.array([[origin[0] + x, origin[1] + y] for x, y in _wall_corners])
         ax.scatter(wcpts[:, 0], wcpts[:, 1],
                    s=140, marker='X', c='steelblue', edgecolors='black',
                    linewidths=0.8, zorder=6, label='Wall corners')
+
+    # ── Wall corners — histogram ───────────────────────────────────────────────
+    if _wall_corners_hist:
+        whpts = np.array([[origin[0] + x, origin[1] + y] for x, y in _wall_corners_hist])
+        ax.scatter(whpts[:, 0], whpts[:, 1],
+                   s=140, marker='X', c='mediumpurple', edgecolors='black',
+                   linewidths=0.8, zorder=6, label='Wall corners (hist)')
 
     # ── Winning positioning corner (green, topmost) ────────────────────────────
     if _positioning_corner is not None:
@@ -161,8 +176,8 @@ def _redraw():
         ax.set_ylim(-margin, FIELD_HEIGHT + margin)
     elif arrow_origin is not None:
         cx, cy  = arrow_origin
-        spread  = max(pts[:, 0].max() - pts[:, 0].min(),
-                      pts[:, 1].max() - pts[:, 1].min(), 0.5) / 2 + 0.3
+        spread  = max(float(pts[:, 0].max() - pts[:, 0].min()),
+                      float(pts[:, 1].max() - pts[:, 1].min()), 0.5) / 2 + 0.3
         ax.set_xlim(cx - spread, cx + spread)
         ax.set_ylim(cy - spread, cy + spread)
 
@@ -176,7 +191,7 @@ def _redraw():
     ax.set_title(
         f"Twin Visualisation\n"
         f"pos={pos_str}  field_angle={fa:.1f}° ({src})"
-        f"  walls={len(_walls)}  corners={len(_corners)}  bots={len(_other_robots)}"
+        f"  walls={len(_walls)}/hist={len(_walls_hist)}  corners={len(_corners)}  bots={len(_other_robots)}"
     )
     ax.grid(True, alpha=0.25, zorder=0)
 
@@ -187,7 +202,8 @@ def _redraw():
 # ── Broker callbacks ──────────────────────────────────────────────────────────
 def on_update(key, value):
     global _lidar, _field_angle, _sim_heading
-    global _robot_pos, _other_robots, _corners, _wall_corners, _walls, _positioning_corner
+    global _robot_pos, _other_robots, _corners, _wall_corners, _wall_corners_hist
+    global _walls, _walls_hist, _positioning_corner
 
     if value is None:
         return
@@ -218,11 +234,17 @@ def on_update(key, value):
             elif key == "wall_corners":
                 _wall_corners = json.loads(value)
 
+            elif key == "wall_corners_hist":
+                _wall_corners_hist = json.loads(value)
+
             elif key == "positioning_corner":
                 _positioning_corner = json.loads(value)
 
             elif key == "lidar_walls":
                 _walls = json.loads(value)
+
+            elif key == "lidar_walls_hist":
+                _walls_hist = json.loads(value)
 
     except Exception as e:
         print(f"[VIS] parse error on {key!r}: {e}")
@@ -241,8 +263,10 @@ if __name__ == "__main__":
         "other_robots":   lambda v: [[float(r["x"]), float(r["y"]), r.get("method", "")] for r in json.loads(v)],
         "depth_corners":  lambda v: json.loads(v),
         "wall_corners":       lambda v: json.loads(v),
+        "wall_corners_hist":  lambda v: json.loads(v),
         "positioning_corner": lambda v: json.loads(v),
-        "lidar_walls":    lambda v: json.loads(v),
+        "lidar_walls":      lambda v: json.loads(v),
+        "lidar_walls_hist": lambda v: json.loads(v),
     }
     _TARGETS = {
         "field_angle":    "_field_angle",
@@ -252,8 +276,10 @@ if __name__ == "__main__":
         "other_robots":   "_other_robots",
         "depth_corners":  "_corners",
         "wall_corners":       "_wall_corners",
+        "wall_corners_hist":  "_wall_corners_hist",
         "positioning_corner": "_positioning_corner",
-        "lidar_walls":    "_walls",
+        "lidar_walls":      "_walls",
+        "lidar_walls_hist": "_walls_hist",
     }
     for key, parse in _SEEDS.items():
         try:

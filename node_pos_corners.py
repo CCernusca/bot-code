@@ -10,7 +10,8 @@ OUTLIER_DIST = 0.15
 
 mb = TelemetryBroker()
 
-_walls = []   # latest walls from broker, used for intersection_corners
+_walls      = []   # latest primary walls from broker
+_walls_hist = []   # latest histogram walls from broker
 
 
 def _filter_outliers(corner_xy):
@@ -53,7 +54,7 @@ def _filter_outliers(corner_xy):
 
 
 def on_update(key, value):
-    global _walls
+    global _walls, _walls_hist
 
     if value is None:
         return
@@ -71,7 +72,7 @@ def on_update(key, value):
             )
             for a in sorted_angles
         ]
-        corner_xy = _filter_outliers(simple_corners(points, window=5, proximity=0.3))
+        corner_xy = _filter_outliers(simple_corners(points, window=7, proximity=0.3))
         corners = [
             (int(round(math.degrees(math.atan2(y, x)) % 360)), int(round(math.hypot(x, y) * 1000)))
             for x, y in corner_xy
@@ -86,9 +87,17 @@ def on_update(key, value):
         pts = intersection_corners(_walls)
         mb.set("wall_corners", json.dumps([[round(x, 3), round(y, 3)] for x, y in pts]))
 
+    elif key == "lidar_walls_hist":
+        try:
+            _walls_hist = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return
+        pts = intersection_corners(_walls_hist)
+        mb.set("wall_corners_hist", json.dumps([[round(x, 3), round(y, 3)] for x, y in pts]))
+
 
 if __name__ == "__main__":
-    mb.setcallback(["lidar", "lidar_walls"], on_update)
+    mb.setcallback(["lidar", "lidar_walls", "lidar_walls_hist"], on_update)
     try:
         mb.receiver_loop()
     except KeyboardInterrupt:
