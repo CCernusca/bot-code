@@ -34,3 +34,18 @@ def simple_corners(points, window=3, proximity=0.1):
 	prox_ok   = np.all(nbr_dists < proximity, axis=1)       # (M,)
 
 	return [tuple(p) for p in centers[depth_ok & prox_ok]]
+
+
+def intersection_corners(walls):
+	"""
+	Returns all intersection points between horizontal and vertical walls.
+
+	walls: list of {"gradient": 0|None, "offset": float}
+	  gradient == 0    → horizontal wall at y = offset  (robot-centred)
+	  gradient == None → vertical   wall at x = offset  (robot-centred)
+
+	Returns a list of (x, y) tuples, one per H×V pair.
+	"""
+	horizontals = [w["offset"] for w in walls if w.get("gradient") == 0]
+	verticals   = [w["offset"] for w in walls if w.get("gradient") is None]
+	return [(vx, hy) for hy in horizontals for vx in verticals]

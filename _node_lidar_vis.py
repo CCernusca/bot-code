@@ -19,14 +19,14 @@ def on_data_change(key, value):
         raw = json.loads(value)
         # JSON keys are always strings — restore to int degrees
         _angle_dict = {int(k): v for k, v in raw.items()}
-    elif key == "lidar_corners":
+    elif key == "depth_corners":
         _corners = json.loads(value)
 
     vis.update(_angle_dict, _corners)
 
 
 if __name__ == "__main__":
-    mb.setcallback(["lidar", "lidar_corners"], on_data_change)
+    mb.setcallback(["lidar", "depth_corners"], on_data_change)
     try:
         mb.receiver_loop()
     except KeyboardInterrupt:
