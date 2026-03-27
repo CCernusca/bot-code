@@ -3,9 +3,9 @@ import json
 import math
 
 # ── Field & detection configuration ──────────────────────────────────────────
-FIELD_WIDTH      = 1.0    # metres, X axis
-FIELD_HEIGHT     = 2.0    # metres, Y axis
-ROBOT_RADIUS     = 0.1    # metres — assumed radius of all robots
+FIELD_WIDTH      = 1.82    # metres, X axis
+FIELD_HEIGHT     = 2.43    # metres, Y axis
+ROBOT_RADIUS     = 0.09    # metres — assumed radius of all robots
 
 # A lidar hit is classified as a wall hit if it falls within this distance of
 # any field boundary.  Slightly smaller than ROBOT_RADIUS so that robots near
