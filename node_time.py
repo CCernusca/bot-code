@@ -1,0 +1,92 @@
+from robus_core.libs.lib_telemtrybroker import TelemetryBroker
+import json
+import threading
+import time
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+TIME_PUBLISH_HZ    = 10   # how often system_time is updated on the broker
+POSITION_WINDOW_S  = 3.0  # seconds of position history to retain
+POSITION_SAMPLE_S  = 0.5  # minimum interval between saved position samples
+# ─────────────────────────────────────────────────────────────────────────────
+
+mb              = TelemetryBroker()
+_start          = time.monotonic()
+_pos_lock       = threading.Lock()
+_pos_history    = []    # [{"x": float, "y": float, "t": float}, ...]
+_pos_last_t     = -999  # monotonic time of the last saved position sample
+_robots_lock    = threading.Lock()
+_robots_history = []    # [{"t": float, "robots": [{"x": float, "y": float}]}, ...]
+_robots_last_t  = -999  # monotonic time of the last saved robots sample
+
+
+def _elapsed():
+    return time.monotonic() - _start
+
+
+def _prune_list(lst, window=POSITION_WINDOW_S):
+    """Remove entries older than window seconds. Call with the relevant lock held."""
+    cutoff = _elapsed() - window
+    while lst and lst[0]["t"] < cutoff:
+        lst.pop(0)
+
+
+def _time_loop():
+    interval = 1.0 / TIME_PUBLISH_HZ
+    while True:
+        mb.set("system_time", str(round(_elapsed(), 3)))
+        time.sleep(interval)
+
+
+def on_update(key, value):
+    global _pos_last_t, _robots_last_t
+
+    if value is None:
+        return
+
+    now = time.monotonic()
+
+    if key == "robot_position":
+        if now - _pos_last_t < POSITION_SAMPLE_S:
+            return
+        try:
+            pos = json.loads(value)
+            entry = {"x": float(pos["x"]), "y": float(pos["y"]), "t": round(_elapsed(), 3)}
+        except Exception:
+            return
+        _pos_last_t = now
+        with _pos_lock:
+            _pos_history.append(entry)
+            _prune_list(_pos_history)
+            snapshot = list(_pos_history)
+        mb.set("position_history", json.dumps(snapshot))
+
+    elif key == "other_robots":
+        if now - _robots_last_t < POSITION_SAMPLE_S:
+            return
+        try:
+            payload = json.loads(value)
+            # Support both new {"origin":…,"robots":[…]} and old bare-list formats.
+            robot_list = payload.get("robots", payload) if isinstance(payload, dict) else payload
+            robots = [{"x": float(r["x"]), "y": float(r["y"]),
+                       "id": int(r.get("id", 0))}
+                      for r in robot_list]
+        except Exception:
+            return
+        _robots_last_t = now
+        entry = {"t": round(_elapsed(), 3), "robots": robots}
+        with _robots_lock:
+            _robots_history.append(entry)
+            _prune_list(_robots_history)
+            snapshot = list(_robots_history)
+        mb.set("other_robots_history", json.dumps(snapshot))
+
+
+if __name__ == "__main__":
+    threading.Thread(target=_time_loop, daemon=True, name="time-publisher").start()
+
+    mb.setcallback(["robot_position", "other_robots"], on_update)
+    try:
+        mb.receiver_loop()
+    except KeyboardInterrupt:
+        print("\nStopping time node.")
+        mb.close()

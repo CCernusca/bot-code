@@ -15,17 +15,20 @@ ROBOT_RADIUS = 0.09   # metres
 mb = TelemetryBroker()
 
 # ── Broker state ──────────────────────────────────────────────────────────────
-_lidar        = {}    # {angle_deg (int): dist_mm (int)}  — sensor frame
-_field_angle  = None  # float | None
-_sim_heading  = None  # float | None
-_robot_pos    = None  # (x, y) metres, field frame
-_other_robots = []    # [[x, y], ...]  field frame
+_lidar            = {}    # {angle_deg (int): dist_mm (int)}  — sensor frame
+_detection_origin = None  # (rx, ry) position snapshot from the last detection cycle
+_field_angle      = None  # float | None
+_sim_heading      = None  # float | None
+_robot_pos        = None  # (x, y) metres, field frame
+_other_robots     = []    # [[x, y, method, id], ...]  field frame
 _corners      = []    # [[angle_deg, dist_mm], ...]  sensor frame
 _wall_corners       = []   # [[x, y], ...]  robot-centred field-aligned metres (primary)
 _wall_corners_hist  = []   # [[x, y], ...]  robot-centred field-aligned metres (histogram)
 _walls              = []   # [{"gradient": 0|None, "offset": float}]  robot-centred
 _walls_hist         = []   # same format, from histogram detection
-_positioning_corner = None # {"dx": float, "dy": float}  robot-centred field-aligned
+_positioning_corner  = None # {"dx": float, "dy": float}  robot-centred field-aligned
+_position_history    = []   # [{"x", "y", "t"}, ...]
+_other_robots_history = []  # [{"t", "robots": [{"x","y"}]}, ...]
 
 _state_lock    = threading.Lock()
 _needs_redraw  = threading.Event()
@@ -62,11 +65,19 @@ def _redraw():
     known_pos   = _robot_pos is not None
     origin      = _robot_pos if known_pos else (0.0, 0.0)
 
-    # ── Lidar points (rotated to field frame, shifted to robot position) ──────
+    # ── Lidar points ──────────────────────────────────────────────────────────
+    # Use the detection-origin snapshot bundled in the last other_robots message
+    # so that the scatter and the detected circles share the exact coordinate
+    # frame, eliminating the inter-process race that otherwise shifts them apart.
     pts = None
     if _lidar:
+        # Heading (fa_rad) comes from sim_heading published per-scan — always
+        # current and consistent across processes, so use the vis's own value.
+        # Position origin uses the detection snapshot to match the circles.
+        lidar_origin = (_detection_origin[0], _detection_origin[1]) \
+                       if _detection_origin is not None else origin
         pts = np.array([
-            _lidar_to_field(a, d, fa_rad, origin)
+            _lidar_to_field(a, d, fa_rad, lidar_origin)
             for a, d in _lidar.items()
         ])
         ax.scatter(pts[:, 0], pts[:, 1],
@@ -108,23 +119,40 @@ def _redraw():
         rx, ry = origin
         ax.add_patch(patches.Circle(
             (rx, ry), ROBOT_RADIUS,
-            linewidth=1.5, edgecolor='#2a7a2a', facecolor='#c8f0c8', zorder=7,
+            linewidth=1.5, edgecolor='#555555', facecolor='#cccccc', zorder=7,
         ))
 
         # ── Other robots ──────────────────────────────────────────────────────
-        for i, r in enumerate(_other_robots):
-            ox, oy   = r[0], r[1]
-            centroid = str(r[2]).startswith("centroid") if len(r) > 2 else False
-            if centroid:
-                ax.scatter(ox, oy, s=200, marker='X', c='yellow', edgecolors='#c07000',
-                           linewidths=1.5, zorder=7)
+        for r in _other_robots:
+            ox, oy    = r[0], r[1]
+            method    = str(r[2]) if len(r) > 2 else ""
+            rid       = int(r[3]) if len(r) > 3 else 0
+            predicted = method == "predicted"
+            centroid  = method.startswith("centroid")
+
+            # Unique colour per ID via tab10 (cycles every 10 IDs)
+            c_solid = plt.cm.tab10((rid - 1) % 10)[:3]
+            c_face  = (*c_solid, 0.15 if predicted else 0.3)
+
+            if predicted:
+                # Dashed circle at extrapolated position
+                ax.add_patch(patches.Circle(
+                    (ox, oy), ROBOT_RADIUS,
+                    linewidth=1.5, edgecolor=c_solid, facecolor=c_face,
+                    linestyle='--', zorder=6,
+                ))
+            elif centroid:
+                ax.scatter(ox, oy, s=200, marker='X',
+                           color=c_solid, linewidths=1.5, zorder=7)
             else:
                 ax.add_patch(patches.Circle(
                     (ox, oy), ROBOT_RADIUS,
-                    linewidth=1.5, edgecolor='#c07000', facecolor='#ffe0a0', zorder=7,
+                    linewidth=1.5, edgecolor=c_solid, facecolor=c_face, zorder=7,
                 ))
-            ax.text(ox, oy + ROBOT_RADIUS + 0.03, str(i + 1),
-                    ha='center', va='bottom', fontsize=8, color='#c07000', zorder=8)
+            ax.text(ox, oy + ROBOT_RADIUS + 0.03, f"#{rid}",
+                    ha='center', va='bottom', fontsize=8,
+                    color=c_solid, fontweight='bold',
+                    alpha=0.5 if predicted else 1.0, zorder=8)
 
     # ── Heading arrow (always drawn if an origin is available) ───────────────
     if arrow_origin is not None:
@@ -134,7 +162,7 @@ def _redraw():
             "", xy=(ax_x + arrow_len * math.cos(fa_rad),
                     ax_y + arrow_len * math.sin(fa_rad)),
             xytext=(ax_x, ax_y),
-            arrowprops=dict(arrowstyle='->', color='#2a7a2a', lw=2.0),
+            arrowprops=dict(arrowstyle='->', color='#555555', lw=2.0),
             zorder=8,
         )
 
@@ -161,6 +189,30 @@ def _redraw():
         ax.scatter(whpts[:, 0], whpts[:, 1],
                    s=140, marker='X', c='mediumpurple', edgecolors='black',
                    linewidths=0.8, zorder=6, label='Wall corners (hist)')
+
+    # ── Position history — fading green trail ────────────────────────────────
+    if known_pos and len(_position_history) > 1:
+        t0  = _position_history[0]["t"]
+        t1  = _position_history[-1]["t"]
+        rng = max(t1 - t0, 1e-9)
+        xs  = [p["x"] for p in _position_history]
+        ys  = [p["y"] for p in _position_history]
+        colors = [(0.4, 0.4, 0.4, 0.05 + 0.7 * (p["t"] - t0) / rng)
+                  for p in _position_history]
+        ax.scatter(xs, ys, s=18, color=colors, zorder=5)
+
+    # ── Other robots history — fading per-ID coloured trail ──────────────────
+    if known_pos and _other_robots_history:
+        t0  = _other_robots_history[0]["t"]
+        t1  = _other_robots_history[-1]["t"]
+        rng = max(t1 - t0, 1e-9)
+        for snap in _other_robots_history:
+            alpha = 0.05 + 0.6 * (snap["t"] - t0) / rng
+            for r in snap["robots"]:
+                rid     = int(r.get("id", 0))
+                c_solid = plt.cm.tab10((rid - 1) % 10)[:3]
+                ax.scatter(r["x"], r["y"], s=18,
+                           color=(*c_solid, alpha), zorder=5)
 
     # ── Winning positioning corner (green, topmost) ────────────────────────────
     if _positioning_corner is not None:
@@ -201,9 +253,10 @@ def _redraw():
 
 # ── Broker callbacks ──────────────────────────────────────────────────────────
 def on_update(key, value):
-    global _lidar, _field_angle, _sim_heading
+    global _lidar, _detection_origin, _field_angle, _sim_heading
     global _robot_pos, _other_robots, _corners, _wall_corners, _wall_corners_hist
     global _walls, _walls_hist, _positioning_corner
+    global _position_history, _other_robots_history
 
     if value is None:
         return
@@ -225,8 +278,21 @@ def on_update(key, value):
                 _robot_pos = (float(p["x"]), float(p["y"]))
 
             elif key == "other_robots":
-                _other_robots = [[float(r["x"]), float(r["y"]), r.get("method", "")]
-                                  for r in json.loads(value)]
+                payload = json.loads(value)
+                # New format: {"origin": {x, y}, "robots": [...]}
+                # Fallback: bare list (old format / other producers)
+                if isinstance(payload, dict):
+                    orig = payload.get("origin")
+                    if orig:
+                        # Only position — heading is consistent across processes
+                        # (sim_heading is published per-scan before lidar).
+                        _detection_origin = (float(orig["x"]), float(orig["y"]))
+                    robot_list = payload.get("robots", [])
+                else:
+                    robot_list = payload
+                _other_robots = [[float(r["x"]), float(r["y"]),
+                                   r.get("method", ""), int(r.get("id", 0))]
+                                  for r in robot_list]
 
             elif key == "depth_corners":
                 _corners = json.loads(value)
@@ -246,6 +312,12 @@ def on_update(key, value):
             elif key == "lidar_walls_hist":
                 _walls_hist = json.loads(value)
 
+            elif key == "position_history":
+                _position_history = json.loads(value)
+
+            elif key == "other_robots_history":
+                _other_robots_history = json.loads(value)
+
     except Exception as e:
         print(f"[VIS] parse error on {key!r}: {e}")
         return
@@ -260,13 +332,16 @@ if __name__ == "__main__":
         "sim_heading":    lambda v: float(v),
         "lidar":          lambda v: {int(k): int(x) for k, x in json.loads(v).items()},
         "robot_position": lambda v: (float(json.loads(v)["x"]), float(json.loads(v)["y"])),
-        "other_robots":   lambda v: [[float(r["x"]), float(r["y"]), r.get("method", "")] for r in json.loads(v)],
+        "other_robots":   lambda v: [[float(r["x"]), float(r["y"]), r.get("method", ""), int(r.get("id", 0))]
+                                      for r in (lambda p: p.get("robots", p) if isinstance(p, dict) else p)(json.loads(v))],
         "depth_corners":  lambda v: json.loads(v),
         "wall_corners":       lambda v: json.loads(v),
         "wall_corners_hist":  lambda v: json.loads(v),
         "positioning_corner": lambda v: json.loads(v),
-        "lidar_walls":      lambda v: json.loads(v),
-        "lidar_walls_hist": lambda v: json.loads(v),
+        "lidar_walls":           lambda v: json.loads(v),
+        "lidar_walls_hist":      lambda v: json.loads(v),
+        "position_history":      lambda v: json.loads(v),
+        "other_robots_history":  lambda v: json.loads(v),
     }
     _TARGETS = {
         "field_angle":    "_field_angle",
@@ -278,8 +353,10 @@ if __name__ == "__main__":
         "wall_corners":       "_wall_corners",
         "wall_corners_hist":  "_wall_corners_hist",
         "positioning_corner": "_positioning_corner",
-        "lidar_walls":      "_walls",
-        "lidar_walls_hist": "_walls_hist",
+        "lidar_walls":           "_walls",
+        "lidar_walls_hist":      "_walls_hist",
+        "position_history":      "_position_history",
+        "other_robots_history":  "_other_robots_history",
     }
     for key, parse in _SEEDS.items():
         try:
