@@ -22,6 +22,12 @@ def on_measurement(angle, distance, quality):
         _batch_count = 0
 
 
+def on_scan(batch):
+    """Batch callback for simulation: receives a full {angle: dist_mm} dict at once."""
+    angle_dict.update(batch)
+    mb.set("lidar", json.dumps(angle_dict))
+
+
 if __name__ == "__main__":
     raw_queue = queue.Queue(maxsize=36000)  # ~10 full scans of headroom
     try:
@@ -42,6 +48,14 @@ if __name__ == "__main__":
             def _on_sim_ready(px, py, angle_f):
                 mb.set("sim_heading", str(round(angle_f, 1)))
 
-            lidar_sim.read_lidar_data(on_measurement, on_ready=_on_sim_ready)
+            def _on_sim_heading(heading_deg):
+                mb.set("sim_heading", str(round(heading_deg, 1)))
+
+            lidar_sim.read_lidar_data(on_measurement, on_ready=_on_sim_ready,
+                                      on_heading=_on_sim_heading,
+                                      on_scan=on_scan)
+            # Per-ray fallback (realistic drip-feed, matches real hardware):
+            # lidar_sim.read_lidar_data(on_measurement, on_ready=_on_sim_ready,
+            #                           on_heading=_on_sim_heading)
         else:
             raise

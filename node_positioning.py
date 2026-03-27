@@ -13,6 +13,8 @@ ROBOT_RADIUS = 0.09   # metres — robot centre cannot be closer than this to an
 _MARGIN = 0.05   # metres
 # Maximum distance between two candidate positions to be considered "the same".
 _OUTLIER_THRESHOLD = 0.15  # metres
+# How far outside the field boundary a lidar point is allowed to land.
+_LIDAR_FIELD_TOL = 0.05  # metres
 # ──────────────────────────────────────────────────────────────────────────────
 
 _FIELD_CORNERS = [
@@ -27,6 +29,7 @@ mb = TelemetryBroker()
 # State updated by broker callbacks
 _field_angle   = None  # degrees — explicitly set field angle; None = not set
 _sim_heading   = None  # degrees — angle_f from lidar simulation, used as fallback
+_lidar              = {}    # {angle_deg (int): dist_mm (int)}  — sensor frame
 _depth_corners      = []    # [(angle_deg, dist_mm), ...]  sensor polar frame
 _wall_corners       = []    # [[x, y], ...]  robot-centred field-aligned metres
 _wall_corners_hist  = []    # [[x, y], ...]  from histogram wall detection
@@ -88,6 +91,17 @@ def _compute_position():
         print(f"  wallH #{i}  offset=({wx:.3f}, {wy:.3f}) m  dist={dist_mm:.0f} mm")
         displacements.append((wx, wy, f"wallH#{i}", dist_mm))
 
+    # ── Precompute lidar bounding box (field-aligned, robot-centred) ─────────
+    # Shifting by (rx, ry) gives the field-frame AABB of all lidar points.
+    lidar_min_x = lidar_max_x = lidar_min_y = lidar_max_y = 0.0
+    if _lidar:
+        offsets_x = [dist_mm / 1000.0 * math.cos(math.radians(a) + fa_rad)
+                     for a, dist_mm in _lidar.items()]
+        offsets_y = [dist_mm / 1000.0 * math.sin(math.radians(a) + fa_rad)
+                     for a, dist_mm in _lidar.items()]
+        lidar_min_x, lidar_max_x = min(offsets_x), max(offsets_x)
+        lidar_min_y, lidar_max_y = min(offsets_y), max(offsets_y)
+
     # ── Generate candidates ───────────────────────────────────────────────────
     # (rx, ry, label, field_corner_xy, dist_mm)
     candidates = []
@@ -98,6 +112,13 @@ def _compute_position():
                 ROBOT_RADIUS - _MARGIN <= rx <= FIELD_WIDTH  - ROBOT_RADIUS + _MARGIN and
                 ROBOT_RADIUS - _MARGIN <= ry <= FIELD_HEIGHT - ROBOT_RADIUS + _MARGIN
             )
+            if inside and _lidar:
+                inside = (
+                    rx + lidar_min_x >= -_LIDAR_FIELD_TOL and
+                    rx + lidar_max_x <= FIELD_WIDTH  + _LIDAR_FIELD_TOL and
+                    ry + lidar_min_y >= -_LIDAR_FIELD_TOL and
+                    ry + lidar_max_y <= FIELD_HEIGHT + _LIDAR_FIELD_TOL
+                )
             print(f"    [{label}] vs ({cx}, {cy})  →  robot=({rx:.3f}, {ry:.3f})"
                   f"  {'✓' if inside else '✗'}")
             if inside:
@@ -134,10 +155,18 @@ def _compute_position():
 
 
 def on_update(key, value):
-    global _field_angle, _sim_heading, _depth_corners, _wall_corners, _wall_corners_hist
+    global _field_angle, _sim_heading, _lidar, _depth_corners, _wall_corners, _wall_corners_hist
 
     if value is None:
         return
+
+    if key == "lidar":
+        try:
+            raw = json.loads(value)
+            _lidar = {int(k): int(v) for k, v in raw.items()}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return   # lidar alone doesn't trigger repositioning
 
     if key == "field_angle":
         try:
@@ -191,7 +220,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    mb.setcallback(["field_angle", "sim_heading", "depth_corners", "wall_corners", "wall_corners_hist"], on_update)
+    mb.setcallback(["lidar", "field_angle", "sim_heading", "depth_corners", "wall_corners", "wall_corners_hist"], on_update)
     try:
         mb.receiver_loop()
     except KeyboardInterrupt:

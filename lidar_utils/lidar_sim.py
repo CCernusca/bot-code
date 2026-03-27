@@ -1,95 +1,265 @@
 import math
 import random
+import threading
 import time
+import numpy as np
 
-SIM_QUALITY  = 15   # Simulated quality value passed to on_update
-SIM_JITTER_MM = 8   # Gaussian noise (std dev, mm) added to each distance reading
+SIM_QUALITY      = 15              # simulated quality value passed to on_update
+SIM_JITTER_MM    = 4               # Gaussian noise std dev (mm) per reading
+SIM_MAX_SPEED    = 0.4             # m/s  — maximum speed (all robots)
+SIM_OBS_ACCEL    = 0.3             # m/s² — random 2-D acceleration for obstacles
+SIM_ROB_ACCEL    = 0.6             # m/s² — scalar accel/decel along robot heading
+SIM_MAX_TURN_RAD = math.radians(90)  # rad/s — maximum heading turn rate
+SIM_PHYSICS_HZ   = 60             # physics updates per second
+SIM_SCAN_HZ      = 10             # complete lidar scan cycles per second
 
-def read_lidar_data(on_update, on_ready=None, width=1.82, length=2.43, step_size=1, proximity=0.1, robot_radius=0.09):
+
+# ── Ray casting ───────────────────────────────────────────────────────────────
+
+def _cast_rays_np(px, py, heading_deg, obstacles, width, length, angles_deg, obstacle_radius):
     """
-    Simulates RPLidar C1 sensor data continuously.
-    Calls on_update(angle, distance, quality) for each measurement.
-    Calls on_ready(px, py, angle_f) once before the loop starts, if provided.
-    Distances are in millimeters, matching the real sensor format.
+    Cast all rays at once using numpy.
+
+    angles_deg      : 1-D numpy array of sensor angles in degrees.
+    heading_deg     : scalar field-heading offset (degrees).
+    Returns a 1-D numpy array of distances in metres, one per angle.
+    """
+    rad = np.radians(angles_deg + heading_deg)
+    ux  = np.cos(rad)
+    uy  = np.sin(rad)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dists = np.minimum.reduce([
+            np.where(ux >  1e-9, (width  - px) / ux, np.inf),
+            np.where(ux < -1e-9,            -px / ux, np.inf),
+            np.where(uy >  1e-9, (length - py) / uy, np.inf),
+            np.where(uy < -1e-9,            -py / uy, np.inf),
+        ])
+
+    for ox, oy in obstacles:
+        vx, vy   = ox - px, oy - py
+        d_proj   = vx * ux + vy * uy
+        d_perp_sq = (vx * uy - vy * ux) ** 2
+        disc     = obstacle_radius ** 2 - d_perp_sq
+        valid    = (d_proj > 0) & (disc > 0)
+        hit      = d_proj - np.sqrt(np.where(valid, disc, 0.0))
+        dists    = np.where(valid & (hit > 0) & (hit < dists), hit, dists)
+
+    return dists
+
+
+def _cast_rays(px, py, angle_f, obstacles, width, length, step_size, obstacle_radius):
+    """Full 360° scan — used by get_boundary_distances."""
+    angles = np.arange(0, 360, step_size, dtype=float)
+    dists  = _cast_rays_np(px, py, angle_f, obstacles, width, length, angles, obstacle_radius)
+    return list(zip(angles.astype(int), dists.tolist()))
+
+
+# ── Physics ───────────────────────────────────────────────────────────────────
+
+def _elastic_collide(pos_a, vel_a, pos_b, vel_b, sep):
+    """Equal-mass elastic collision between two circles. Modifies in-place."""
+    dx, dy = pos_b[0] - pos_a[0], pos_b[1] - pos_a[1]
+    dist = math.hypot(dx, dy)
+    if not (1e-9 < dist < sep):
+        return
+    nx, ny = dx / dist, dy / dist
+    push   = (sep - dist) / 2
+    pos_a[0] -= nx * push;  pos_a[1] -= ny * push
+    pos_b[0] += nx * push;  pos_b[1] += ny * push
+    dv = (vel_a[0] - vel_b[0]) * nx + (vel_a[1] - vel_b[1]) * ny
+    vel_a[0] -= dv * nx;  vel_a[1] -= dv * ny
+    vel_b[0] += dv * nx;  vel_b[1] += dv * ny
+
+
+def _wall_bounce(pos, vel, radius, width, length):
+    """Reflect off field boundaries. Modifies in-place."""
+    if pos[0] < radius:
+        pos[0] = radius;          vel[0] = abs(vel[0])
+    elif pos[0] > width - radius:
+        pos[0] = width - radius;  vel[0] = -abs(vel[0])
+    if pos[1] < radius:
+        pos[1] = radius;          vel[1] = abs(vel[1])
+    elif pos[1] > length - radius:
+        pos[1] = length - radius; vel[1] = -abs(vel[1])
+
+
+def _physics_step(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
+                  robot_radius, obstacle_radius, width, length, dt):
+    """Advance all robots one physics step. All pos/vel/heading lists modified in-place."""
+
+    # ── Main robot: heading-based steering + scalar accel ─────────────────────
+    rob_heading[0] += random.uniform(-SIM_MAX_TURN_RAD, SIM_MAX_TURN_RAD) * dt
+    accel = random.uniform(-SIM_ROB_ACCEL, SIM_ROB_ACCEL) * dt
+    rob_vel[0] += math.cos(rob_heading[0]) * accel
+    rob_vel[1] += math.sin(rob_heading[0]) * accel
+    speed = math.hypot(rob_vel[0], rob_vel[1])
+    if speed > SIM_MAX_SPEED:
+        s = SIM_MAX_SPEED / speed
+        rob_vel[0] *= s;  rob_vel[1] *= s
+
+    # ── Obstacles: random 2-D acceleration ────────────────────────────────────
+    for vel in obs_vel:
+        vel[0] += random.uniform(-SIM_OBS_ACCEL, SIM_OBS_ACCEL) * dt
+        vel[1] += random.uniform(-SIM_OBS_ACCEL, SIM_OBS_ACCEL) * dt
+        speed = math.hypot(vel[0], vel[1])
+        if speed > SIM_MAX_SPEED:
+            s = SIM_MAX_SPEED / speed
+            vel[0] *= s;  vel[1] *= s
+
+    # ── Integrate all ─────────────────────────────────────────────────────────
+    all_pos = [rob_pos] + obs_pos
+    all_vel = [rob_vel] + obs_vel
+    all_rad = [robot_radius] + [obstacle_radius] * len(obs_pos)
+
+    for pos, vel in zip(all_pos, all_vel):
+        pos[0] += vel[0] * dt
+        pos[1] += vel[1] * dt
+
+    # ── Wall bounces ──────────────────────────────────────────────────────────
+    for pos, vel, r in zip(all_pos, all_vel, all_rad):
+        _wall_bounce(pos, vel, r, width, length)
+
+    # ── All-pairs elastic collisions ──────────────────────────────────────────
+    n = len(all_pos)
+    for i in range(n):
+        for j in range(i + 1, n):
+            _elastic_collide(all_pos[i], all_vel[i],
+                             all_pos[j], all_vel[j],
+                             all_rad[i] + all_rad[j])
+
+
+def _physics_loop(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
+                  robot_radius, obstacle_radius, width, length,
+                  lock, stop_event):
+    """Physics thread: runs _physics_step at SIM_PHYSICS_HZ."""
+    dt = 1.0 / SIM_PHYSICS_HZ
+    while not stop_event.is_set():
+        t0 = time.monotonic()
+        with lock:
+            _physics_step(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
+                          robot_radius, obstacle_radius, width, length, dt)
+        sleep = dt - (time.monotonic() - t0)
+        if sleep > 0:
+            time.sleep(sleep)
+
+
+# ── Public interface ──────────────────────────────────────────────────────────
+
+def read_lidar_data(on_update, on_ready=None, on_heading=None, on_scan=None, width=1.82, length=2.43,
+                    step_size=1, proximity=0.1, robot_radius=0.09):
+    """
+    Simulates RPLidar C1 with independent physics and lidar threads.
+
+    Physics runs at SIM_PHYSICS_HZ; the lidar spins through angles one ray at a
+    time at SIM_SCAN_HZ, reading the current world state for each ray.
+
+    Calls on_update(angle, distance_mm, quality) per ray.
+    Calls on_ready(px, py, angle_f) once with the initial robot state.
+    Calls on_heading(heading_deg) once per scan with the current robot heading.
     Stops on KeyboardInterrupt.
     """
     print("Starting simulated scan...")
-    px, py, angle_f, _, _, obstacles, results = get_boundary_distances(width, length, step_size, proximity, robot_radius)
+    px, py, angle_f, _, _, init_obstacles, _ = get_boundary_distances(
+        width, length, step_size, proximity, robot_radius
+    )
     print(f"  Robot position : ({px:.3f}, {py:.3f}) m")
     print(f"  Sensor heading : {angle_f:.1f}°")
-    print(f"  Obstacles      : {[(round(ox, 3), round(oy, 3)) for ox, oy in obstacles]}")
+    print(f"  Obstacles      : {[(round(ox, 3), round(oy, 3)) for ox, oy in init_obstacles]}")
+
     if on_ready:
         on_ready(px, py, angle_f)
-    scan = [
-        (angle, int(dist_m * 1000 + random.gauss(0, SIM_JITTER_MM)))
-        for angle, dist_m in results
-        # Blind range = 5cm, Max range = 12m
-        if 50 <= int(dist_m * 1000) <= 12000
-    ]
+
+    # Shared mutable state — all lists so physics thread edits in-place
+    rob_pos     = [px, py]
+    rob_vel     = [0.0, 0.0]
+    rob_heading = [math.radians(angle_f)]   # stored in radians for physics
+    obs_pos     = [[ox, oy] for ox, oy in init_obstacles]
+    obs_vel     = [[0.0, 0.0] for _ in init_obstacles]
+
+    lock       = threading.Lock()
+    stop_event = threading.Event()
+
+    physics_thread = threading.Thread(
+        target=_physics_loop,
+        args=(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
+              robot_radius, proximity, width, length,
+              lock, stop_event),
+        daemon=True,
+        name="sim-physics",
+    )
+    physics_thread.start()
+
+    angles_np    = np.arange(0, 360, step_size, dtype=float)
+    angles_int   = angles_np.astype(int).tolist()
+    scan_interval = 1.0 / SIM_SCAN_HZ
+    scan_count   = 0
+
     try:
         while True:
-            for angle, distance_mm in scan:
-                on_update(angle, distance_mm, SIM_QUALITY)
-            time.sleep(0.1)  # Pause between scan cycles
+            t_scan = time.monotonic()
+
+            # Single lock acquisition for the whole scan snapshot
+            with lock:
+                rx, ry      = rob_pos[0], rob_pos[1]
+                heading_deg = math.degrees(rob_heading[0])
+                obs_snap    = [(p[0], p[1]) for p in obs_pos]
+
+            # Vectorised raycasting — all 360 rays in one numpy call
+            dists_m  = _cast_rays_np(rx, ry, heading_deg, obs_snap,
+                                     width, length, angles_np, proximity)
+            dists_mm = (dists_m * 1000.0)
+            if SIM_JITTER_MM > 0:
+                dists_mm += np.random.normal(0.0, SIM_JITTER_MM, len(angles_np))
+            dists_mm = dists_mm.astype(int).tolist()
+
+            if on_scan:
+                # Batch path: deliver the full scan as a single dict
+                batch = {a: d for a, d in zip(angles_int, dists_mm)
+                         if 50 <= d <= 12000}
+                on_scan(batch)
+            else:
+                # Per-ray path: realistic drip-feed (matches real hardware contract)
+                for angle_deg, dist_mm in zip(angles_int, dists_mm):
+                    if 50 <= dist_mm <= 12000:
+                        on_update(angle_deg, dist_mm, SIM_QUALITY)
+
+            scan_count += 1
+            if on_heading:
+                on_heading(heading_deg % 360)
+            if scan_count % SIM_SCAN_HZ == 0:   # print once per simulated second
+                obs_log = [(round(p[0], 3), round(p[1], 3)) for p in obs_snap]
+                print(f"  [SIM] robot=({rx:.3f}, {ry:.3f})"
+                      f"  heading={heading_deg % 360:.1f}°"
+                      f"  obs={obs_log}")
+
+            # Sleep the remainder of the scan cycle
+            remainder = scan_interval - (time.monotonic() - t_scan)
+            if remainder > 0:
+                time.sleep(remainder)
+
     except KeyboardInterrupt:
         print("\nStopping simulation...")
+    finally:
+        stop_event.set()
+        physics_thread.join(timeout=1.0)
 
 
 def get_boundary_distances(width=1.0, length=2.0, step_size=1, proximity=0.1, robot_radius=0.1):
-    # 1. Random source point and orientation (kept away from walls by robot_radius)
-    px, py = random.uniform(robot_radius, width - robot_radius), random.uniform(robot_radius, length - robot_radius)
+    px      = random.uniform(robot_radius, width  - robot_radius)
+    py      = random.uniform(robot_radius, length - robot_radius)
     angle_f = random.uniform(0, 360)
-    
-    # 2. Generate 3 random obstacle points, each respecting wall, robot and
-    #    inter-obstacle clearance (using proximity as the obstacle radius).
+
     obstacles = []
     for _ in range(3):
         for _ in range(1000):
             ox = random.uniform(proximity, width  - proximity)
             oy = random.uniform(proximity, length - proximity)
-            too_close_to_robot = math.hypot(ox - px, oy - py) < robot_radius + proximity
-            too_close_to_other = any(math.hypot(ox - ex, oy - ey) < 2 * proximity for ex, ey in obstacles)
-            if not too_close_to_robot and not too_close_to_other:
+            if (math.hypot(ox - px, oy - py) >= robot_radius + proximity and
+                    all(math.hypot(ox - ex, oy - ey) >= 2 * proximity
+                        for ex, ey in obstacles)):
                 obstacles.append((ox, oy))
                 break
-    
-    results = []
-    
-    for angle_deg in range(0, 360, step_size):
-        angle_rad = math.radians(angle_deg + angle_f)
-        ux = math.cos(angle_rad) # Unit vector X
-        uy = math.sin(angle_rad) # Unit vector Y
-        
-        # --- Wall Boundary Calculation ---
-        dist_x_max = (width - px) / ux if ux > 0 else float('inf')
-        dist_x_min = (0 - px) / ux if ux < 0 else float('inf')
-        dist_y_max = (length - py) / uy if uy > 0 else float('inf')
-        dist_y_min = (0 - py) / uy if uy < 0 else float('inf')
-        
-        dist_to_wall = min(dist_x_max, dist_x_min, dist_y_max, dist_y_min)
-        
-        # --- Obstacle Detection ---
-        min_dist = dist_to_wall
-        
-        for ox, oy in obstacles:
-            # Vector from source to obstacle
-            vx, vy = ox - px, oy - py
-            
-            # Distance along the ray (Projection)
-            d_proj = vx * ux + vy * uy
-            
-            if d_proj > 0: # Obstacle is in front of the ray
-                # Perpendicular distance from obstacle to ray
-                d_perp = abs(vx * uy - vy * ux)
-                
-                if d_perp < proximity:
-                    # Calculate distance to the edge of the circular proximity zone
-                    # Using Pythagorean theorem: dist^2 + d_perp^2 = proximity^2
-                    hit_dist = d_proj - math.sqrt(proximity**2 - d_perp**2)
-                    
-                    if 0 < hit_dist < min_dist:
-                        min_dist = hit_dist
-        
-        results.append((angle_deg, min_dist))
-        
+
+    results = _cast_rays(px, py, angle_f, obstacles, width, length, step_size, proximity)
     return px, py, angle_f, width, length, obstacles, results
