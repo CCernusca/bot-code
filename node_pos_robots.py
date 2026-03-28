@@ -1,4 +1,5 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
+from utils.perf_monitor import PerfMonitor
 import json
 import math
 import time
@@ -35,7 +36,8 @@ MAX_ROBOT_SPEED = 2.0    # m/s — hard cap after fitting
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-mb = TelemetryBroker()
+mb    = TelemetryBroker()
+_perf = PerfMonitor("node_pos_robots", broker=mb)
 
 _lidar     = {}   # {angle_deg (int): dist_mm (int)}
 _robot_pos = None # (x, y) metres, in field frame
@@ -66,16 +68,10 @@ def _detect_clusters(points, threshold=CLUSTER_THRESHOLD):
     """
     if len(points) == 0:
         return []
-    clusters = []
-    current  = [points[0]]
-    for i in range(1, len(points)):
-        if np.linalg.norm(points[i] - points[i - 1]) < threshold:
-            current.append(points[i])
-        else:
-            clusters.append(np.array(current))
-            current = [points[i]]
-    clusters.append(np.array(current))
-    return clusters
+    diffs  = np.diff(points, axis=0)
+    dists  = np.hypot(diffs[:, 0], diffs[:, 1])
+    splits = np.where(dists >= threshold)[0] + 1
+    return np.split(points, splits)
 
 
 def _is_near_wall(center):
@@ -256,12 +252,13 @@ def _detect_robots():
     fa_rad = math.radians(_heading())
 
     # Build angle-sorted absolute field-frame point array
-    sorted_angles = sorted(_lidar.keys())
-    angles    = np.array([math.radians(a) + fa_rad for a in sorted_angles])
-    distances = np.array([_lidar[a] / 1000.0       for a in sorted_angles])
-    pts       = _lidar_points(angles, distances, (rx, ry))
+    sorted_items  = sorted(_lidar.items())
+    angles        = np.radians([a for a, _ in sorted_items]) + fa_rad
+    distances     = np.array([d for _, d in sorted_items]) / 1000.0
+    pts           = _lidar_points(angles, distances, (rx, ry))
 
-    clusters = _detect_clusters(pts)
+    robot_pos_arr = np.array([rx, ry])
+    clusters      = _detect_clusters(pts)
 
     robots = []
     for cluster in clusters:
@@ -272,8 +269,8 @@ def _detect_robots():
 
         # Arc centroid sits on the near surface; push outward by one radius
         # along the vector from the observing robot to get the true centre.
-        direction = center - np.array([rx, ry])
-        d = np.linalg.norm(direction)
+        direction = center - robot_pos_arr
+        d = np.hypot(direction[0], direction[1])
         if d > 1e-9:
             center = center + (direction / d) * ROBOT_RADIUS
 
@@ -336,8 +333,9 @@ def on_update(key, value):
             return
 
     if key == "lidar":
-        robots, origin = _detect_robots()
-        mb.set("other_robots", json.dumps({"origin": origin, "robots": robots}))
+        with _perf.measure("lidar"):
+            robots, origin = _detect_robots()
+            mb.set("other_robots", json.dumps({"origin": origin, "robots": robots}))
 
 
 if __name__ == "__main__":

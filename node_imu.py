@@ -6,6 +6,7 @@ import time
 import math
 import random
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
+from utils.perf_monitor import PerfMonitor
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 I2C_ADDRESS = 0x4b
@@ -86,6 +87,7 @@ class _SimPitch:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 broker = TelemetryBroker()
+_perf  = PerfMonitor("node_imu", broker=broker, print_every=1000)
 
 if _hw_available:
     _check_baudrate()
@@ -109,17 +111,18 @@ while True:
         continue
 
     try:
-        if _sim is not None:
-            pitch = _sim.read()
-        else:
-            quat = _sensor.quaternion
-            if quat is None:
-                time.sleep(POLL_RATE)
-                continue
-            pitch = _quaternion_to_pitch(*quat)
-            pitch = round(pitch, 2)
+        with _perf.measure("poll"):
+            if _sim is not None:
+                pitch = _sim.read()
+            else:
+                quat = _sensor.quaternion
+                if quat is None:
+                    time.sleep(POLL_RATE)
+                    continue
+                pitch = _quaternion_to_pitch(*quat)
+                pitch = round(pitch, 2)
 
-        broker.set("imu_pitch", str(pitch))
+            broker.set("imu_pitch", str(pitch))
         time.sleep(POLL_RATE)
 
     except KeyboardInterrupt:

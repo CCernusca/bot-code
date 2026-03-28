@@ -1,4 +1,5 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
+from utils.perf_monitor import PerfMonitor
 import json
 import math
 
@@ -15,7 +16,8 @@ _OUTLIER_THRESHOLD = 0.15   # metres
 _LIDAR_FIELD_TOL   = 0.05   # metres
 # ──────────────────────────────────────────────────────────────────────────────
 
-mb = TelemetryBroker()
+mb    = TelemetryBroker()
+_perf = PerfMonitor("node_pos", broker=mb)
 
 _imu_pitch   = None   # degrees — from imu_pitch broker key
 _lidar       = {}     # {angle_deg: dist_mm}
@@ -130,9 +132,10 @@ def on_update(key, value):
         except (json.JSONDecodeError, TypeError):
             return
 
-        pos = _compute_position()
-        if pos is not None:
-            mb.set("robot_position", json.dumps({"x": pos[0], "y": pos[1]}))
+        with _perf.measure("lidar_walls"):
+            pos = _compute_position()
+            if pos is not None:
+                mb.set("robot_position", json.dumps({"x": pos[0], "y": pos[1]}))
 
 
 if __name__ == "__main__":

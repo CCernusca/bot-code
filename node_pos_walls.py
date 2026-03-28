@@ -1,4 +1,5 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
+from utils.perf_monitor import PerfMonitor
 import json
 import numpy as np
 
@@ -9,7 +10,8 @@ MIN_WALL_POINTS = 8
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-mb = TelemetryBroker()
+mb    = TelemetryBroker()
+_perf = PerfMonitor("node_pos_walls", broker=mb)
 
 _lidar     = {}    # angle_deg (int) → dist_mm (int)
 _imu_pitch = None  # degrees — from imu_pitch broker key; None = not yet received
@@ -93,13 +95,14 @@ def on_update(key, value):
         fa = _heading()
         print(f"[WALLS] heading={fa:.1f}°  points={len(_lidar)}")
 
-        pts = _lidar_to_cartesian()
-        if pts is None:
-            return
+        with _perf.measure("lidar"):
+            pts = _lidar_to_cartesian()
+            if pts is None:
+                return
 
-        walls = _detect_walls(pts)
-        print(f"  [WALLS] {len(walls)} wall(s) detected")
-        mb.set("lidar_walls", json.dumps(walls))
+            walls = _detect_walls(pts)
+            print(f"  [WALLS] {len(walls)} wall(s) detected")
+            mb.set("lidar_walls", json.dumps(walls))
 
 
 if __name__ == "__main__":

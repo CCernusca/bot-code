@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
+from utils.perf_monitor import PerfMonitor
 
 # ── Field configuration ───────────────────────────────────────────────────────
 FIELD_WIDTH  = 1.82   # metres
@@ -12,7 +13,8 @@ FIELD_HEIGHT = 2.43   # metres
 ROBOT_RADIUS = 0.09   # metres
 # ─────────────────────────────────────────────────────────────────────────────
 
-mb = TelemetryBroker()
+mb    = TelemetryBroker()
+_perf = PerfMonitor("node_twin_vis", broker=mb, print_every=50)
 
 # ── Broker state ──────────────────────────────────────────────────────────────
 _lidar            = {}    # {angle_deg (int): dist_mm (int)}  — sensor frame
@@ -366,7 +368,8 @@ if __name__ == "__main__":
             if _needs_redraw.is_set():
                 _needs_redraw.clear()
                 with _state_lock:
-                    _redraw()
+                    with _perf.measure("redraw"):
+                        _redraw()
             plt.pause(0.05)
     except KeyboardInterrupt:
         pass
