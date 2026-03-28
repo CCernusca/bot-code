@@ -1,16 +1,28 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
-from lidar_utils.lidar_read import start_producer, parse_packet, SensorUnavailableError
-from lidar_utils import lidar_sim
+from utils import lidar_read_usb, lidar_read_uart, lidar_sim
+from utils.perf_monitor import PerfMonitor
 import json
 import queue
+import threading
 
 SIM_REPLACE = True  # Use simulation if sensor is not found
 BATCH_SIZE  = 360   # Publish to broker every N measurements
 
-mb = TelemetryBroker()
+mb    = TelemetryBroker()
+_perf = PerfMonitor("node_lidar", broker=mb, print_every=50)
 
 angle_dict   = {}
 _batch_count = 0
+_imu_pitch   = None  # degrees — read from broker, never written here
+
+
+def _on_broker_update(key, value):
+    global _imu_pitch
+    if key == "imu_pitch":
+        try:
+            _imu_pitch = float(value)
+        except (ValueError, TypeError):
+            pass
 
 
 def on_measurement(angle, distance, quality):
@@ -18,44 +30,59 @@ def on_measurement(angle, distance, quality):
     angle_dict[int(round(angle))] = distance
     _batch_count += 1
     if _batch_count >= BATCH_SIZE:
-        mb.set("lidar", json.dumps(angle_dict))
+        with _perf.measure("batch"):
+            mb.set("lidar", json.dumps(angle_dict))
         _batch_count = 0
 
 
 def on_scan(batch):
     """Batch callback for simulation: receives a full {angle: dist_mm} dict at once."""
-    angle_dict.update(batch)
-    mb.set("lidar", json.dumps(angle_dict))
+    with _perf.measure("scan"):
+        angle_dict.update(batch)
+        mb.set("lidar", json.dumps(angle_dict))
 
 
 if __name__ == "__main__":
-    raw_queue = queue.Queue(maxsize=36000)  # ~10 full scans of headroom
+    # Seed imu_pitch and subscribe — runs in a daemon thread so it stays live
+    # alongside whichever blocking path (hardware loop or sim) runs below.
     try:
-        producer = start_producer(raw_queue)
-        print("Reading measurements (Ctrl+C to stop)...")
+        val = mb.get("imu_pitch")
+        if val is not None:
+            _imu_pitch = float(val)
+    except Exception:
+        pass
+    mb.setcallback(["imu_pitch"], _on_broker_update)
+    threading.Thread(target=mb.receiver_loop, daemon=True,
+                     name="broker-receiver").start()
+
+    raw_queue = queue.Queue(maxsize=36000)  # ~10 full scans of headroom
+
+    # Try USB first, then UART0, then simulation.
+    for _reader in (lidar_read_usb, lidar_read_uart):
         try:
-            while True:
-                result = parse_packet(raw_queue.get())
-                if result:
-                    on_measurement(*result)
-        except KeyboardInterrupt:
-            print("\nStopping...")
-            producer.stop()
-    except SensorUnavailableError:
+            producer = _reader.start_producer(raw_queue)
+            print(f"Sensor opened on {_reader.PORT}")
+            print("Reading measurements (Ctrl+C to stop)...")
+            try:
+                while True:
+                    result = _reader.parse_packet(raw_queue.get())
+                    if result:
+                        on_measurement(*result)
+            except KeyboardInterrupt:
+                print("\nStopping...")
+                producer.stop()
+            break
+        except _reader.SensorUnavailableError as e:
+            print(f"[{_reader.PORT}] not available: {e}")
+    else:
         if SIM_REPLACE:
             print("Falling back to simulated sensor data.")
-
-            def _on_sim_ready(px, py, angle_f):
-                mb.set("sim_heading", str(round(angle_f, 1)))
-
-            def _on_sim_heading(heading_deg):
-                mb.set("sim_heading", str(round(heading_deg, 1)))
-
-            lidar_sim.read_lidar_data(on_measurement, on_ready=_on_sim_ready,
-                                      on_heading=_on_sim_heading,
-                                      on_scan=on_scan)
-            # Per-ray fallback (realistic drip-feed, matches real hardware):
-            # lidar_sim.read_lidar_data(on_measurement, on_ready=_on_sim_ready,
-            #                           on_heading=_on_sim_heading)
+            lidar_sim.read_lidar_data(
+                on_measurement,
+                get_heading=lambda: _imu_pitch if _imu_pitch is not None else 0.0,
+                on_scan=on_scan,
+                # Per-ray fallback (realistic drip-feed, matches real hardware):
+                # on_scan=None,
+            )
         else:
-            raise
+            raise lidar_read_usb.SensorUnavailableError("No sensor found on any port.")

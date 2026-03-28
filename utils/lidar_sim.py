@@ -37,13 +37,20 @@ def _cast_rays_np(px, py, heading_deg, obstacles, width, length, angles_deg, obs
         ])
 
     for ox, oy in obstacles:
-        vx, vy   = ox - px, oy - py
-        d_proj   = vx * ux + vy * uy
-        d_perp_sq = (vx * uy - vy * ux) ** 2
-        disc     = obstacle_radius ** 2 - d_perp_sq
-        valid    = (d_proj > 0) & (disc > 0)
-        hit      = d_proj - np.sqrt(np.where(valid, disc, 0.0))
-        dists    = np.where(valid & (hit > 0) & (hit < dists), hit, dists)
+        ocx  = px - ox
+        ocy  = py - oy
+        # a = 1 (unit directions), so the quadratic simplifies to:
+        # t = (-b ± sqrt(b² - 4c)) / 2
+        b      = 2 * (ocx * ux + ocy * uy)
+        c      = ocx**2 + ocy**2 - obstacle_radius**2
+        disc   = b**2 - 4 * c
+        valid  = disc >= 0
+        sqrt_d = np.sqrt(np.where(valid, disc, 0.0))
+        t1     = (-b - sqrt_d) / 2
+        t2     = (-b + sqrt_d) / 2
+        t_hit  = np.where(valid & (t1 > 0), t1,
+                 np.where(valid & (t2 > 0), t2, np.inf))
+        dists  = np.minimum(dists, t_hit)
 
     return dists
 
@@ -98,29 +105,39 @@ def _physics_step(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
         s = SIM_MAX_SPEED / speed
         rob_vel[0] *= s;  rob_vel[1] *= s
 
-    # ── Obstacles: random 2-D acceleration ────────────────────────────────────
-    for vel in obs_vel:
-        vel[0] += random.uniform(-SIM_OBS_ACCEL, SIM_OBS_ACCEL) * dt
-        vel[1] += random.uniform(-SIM_OBS_ACCEL, SIM_OBS_ACCEL) * dt
-        speed = math.hypot(vel[0], vel[1])
-        if speed > SIM_MAX_SPEED:
-            s = SIM_MAX_SPEED / speed
-            vel[0] *= s;  vel[1] *= s
+    # ── Obstacles: batched random acceleration + vectorised speed clamp ─────────
+    obs_vel += np.random.uniform(-SIM_OBS_ACCEL, SIM_OBS_ACCEL, obs_vel.shape) * dt
+    speeds   = np.linalg.norm(obs_vel, axis=1)
+    over     = speeds > SIM_MAX_SPEED
+    if np.any(over):
+        scale = np.where(over, SIM_MAX_SPEED / np.maximum(speeds, 1e-9), 1.0)
+        obs_vel *= scale[:, np.newaxis]
 
-    # ── Integrate all ─────────────────────────────────────────────────────────
-    all_pos = [rob_pos] + obs_pos
-    all_vel = [rob_vel] + obs_vel
-    all_rad = [robot_radius] + [obstacle_radius] * len(obs_pos)
+    # ── Integrate positions ───────────────────────────────────────────────────
+    rob_pos[0] += rob_vel[0] * dt
+    rob_pos[1] += rob_vel[1] * dt
+    obs_pos    += obs_vel * dt
 
-    for pos, vel in zip(all_pos, all_vel):
-        pos[0] += vel[0] * dt
-        pos[1] += vel[1] * dt
+    # ── Wall bounce — main robot (scalar) ─────────────────────────────────────
+    _wall_bounce(rob_pos, rob_vel, robot_radius, width, length)
 
-    # ── Wall bounces ──────────────────────────────────────────────────────────
-    for pos, vel, r in zip(all_pos, all_vel, all_rad):
-        _wall_bounce(pos, vel, r, width, length)
+    # ── Wall bounce — obstacles (vectorised) ──────────────────────────────────
+    lo_x, hi_x = obstacle_radius, width  - obstacle_radius
+    lo_y, hi_y = obstacle_radius, length - obstacle_radius
+    hit_x_lo = obs_pos[:, 0] < lo_x;  hit_x_hi = obs_pos[:, 0] > hi_x
+    hit_y_lo = obs_pos[:, 1] < lo_y;  hit_y_hi = obs_pos[:, 1] > hi_y
+    np.clip(obs_pos[:, 0], lo_x, hi_x, out=obs_pos[:, 0])
+    np.clip(obs_pos[:, 1], lo_y, hi_y, out=obs_pos[:, 1])
+    obs_vel[hit_x_lo, 0] =  np.abs(obs_vel[hit_x_lo, 0])
+    obs_vel[hit_x_hi, 0] = -np.abs(obs_vel[hit_x_hi, 0])
+    obs_vel[hit_y_lo, 1] =  np.abs(obs_vel[hit_y_lo, 1])
+    obs_vel[hit_y_hi, 1] = -np.abs(obs_vel[hit_y_hi, 1])
 
     # ── All-pairs elastic collisions ──────────────────────────────────────────
+    # Row views into obs_pos/obs_vel are in-place-modifiable numpy array views.
+    all_pos = [rob_pos] + [obs_pos[i] for i in range(len(obs_pos))]
+    all_vel = [rob_vel] + [obs_vel[i] for i in range(len(obs_vel))]
+    all_rad = [robot_radius] + [obstacle_radius] * len(obs_pos)
     n = len(all_pos)
     for i in range(n):
         for j in range(i + 1, n):
@@ -146,8 +163,8 @@ def _physics_loop(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
 
 # ── Public interface ──────────────────────────────────────────────────────────
 
-def read_lidar_data(on_update, on_ready=None, on_heading=None, on_scan=None, width=1.82, length=2.43,
-                    step_size=1, proximity=0.1, robot_radius=0.09):
+def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None,
+                    width=1.82, length=2.43, step_size=1, proximity=0.1, robot_radius=0.09):
     """
     Simulates RPLidar C1 with independent physics and lidar threads.
 
@@ -174,8 +191,8 @@ def read_lidar_data(on_update, on_ready=None, on_heading=None, on_scan=None, wid
     rob_pos     = [px, py]
     rob_vel     = [0.0, 0.0]
     rob_heading = [math.radians(angle_f)]   # stored in radians for physics
-    obs_pos     = [[ox, oy] for ox, oy in init_obstacles]
-    obs_vel     = [[0.0, 0.0] for _ in init_obstacles]
+    obs_pos     = np.array([[ox, oy] for ox, oy in init_obstacles], dtype=float)
+    obs_vel     = np.zeros((len(init_obstacles), 2))
 
     lock       = threading.Lock()
     stop_event = threading.Event()
@@ -201,9 +218,13 @@ def read_lidar_data(on_update, on_ready=None, on_heading=None, on_scan=None, wid
 
             # Single lock acquisition for the whole scan snapshot
             with lock:
-                rx, ry      = rob_pos[0], rob_pos[1]
-                heading_deg = math.degrees(rob_heading[0])
-                obs_snap    = [(p[0], p[1]) for p in obs_pos]
+                rx, ry           = rob_pos[0], rob_pos[1]
+                _physics_heading = math.degrees(rob_heading[0])
+                obs_snap         = obs_pos.copy()
+
+            # Use externally-supplied heading if provided (e.g. from imu_pitch),
+            # otherwise fall back to the internal physics heading.
+            heading_deg = get_heading() if get_heading is not None else _physics_heading
 
             # Vectorised raycasting — all 360 rays in one numpy call
             dists_m  = _cast_rays_np(rx, ry, heading_deg, obs_snap,
@@ -225,12 +246,11 @@ def read_lidar_data(on_update, on_ready=None, on_heading=None, on_scan=None, wid
                         on_update(angle_deg, dist_mm, SIM_QUALITY)
 
             scan_count += 1
-            if on_heading:
-                on_heading(heading_deg % 360)
             if scan_count % SIM_SCAN_HZ == 0:   # print once per simulated second
                 obs_log = [(round(p[0], 3), round(p[1], 3)) for p in obs_snap]
+                src = "external" if get_heading is not None else "physics"
                 print(f"  [SIM] robot=({rx:.3f}, {ry:.3f})"
-                      f"  heading={heading_deg % 360:.1f}°"
+                      f"  heading={heading_deg % 360:.1f}° ({src})"
                       f"  obs={obs_log}")
 
             # Sleep the remainder of the scan cycle

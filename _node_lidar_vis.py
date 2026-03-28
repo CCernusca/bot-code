@@ -1,5 +1,5 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
-from lidar_utils.lidar_vis import LiveVisualiser
+from utils.lidar_vis import LiveVisualiser
 import json
 
 mb = TelemetryBroker()
