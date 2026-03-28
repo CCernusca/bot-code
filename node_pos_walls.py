@@ -8,6 +8,8 @@ WALL_TOL = 0.05       # metres
 # Minimum number of wall-candidate points required to report a wall.
 MIN_WALL_POINTS = 8
 
+DEBUG = False   # set True to print per-scan wall detection results
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
@@ -28,8 +30,10 @@ def _lidar_to_cartesian():
     """
     if not _lidar:
         return None
-    angles    = np.radians(np.fromiter(_lidar.keys(),   dtype=float)) + np.radians(_heading())
-    distances = np.fromiter(_lidar.values(), dtype=float) / 1000.0
+    n         = len(_lidar)
+    keys, vals = zip(*_lidar.items())
+    angles    = np.radians(np.array(keys, dtype=float)) + np.radians(_heading())
+    distances = np.array(vals, dtype=float) / 1000.0
     return np.column_stack((distances * np.cos(angles), distances * np.sin(angles)))
 
 
@@ -60,13 +64,15 @@ def _detect_walls(pts):
         lo_group = vals[vals <= v_min + WALL_TOL]
         if len(lo_group) >= MIN_WALL_POINTS:
             offset = round(float(np.median(lo_group)), 3)
-            print(f"  [WALLS] {label_lo:6s}  offset={offset:+.3f} m  pts={len(lo_group)}")
+            if DEBUG:
+                print(f"  [WALLS] {label_lo:6s}  offset={offset:+.3f} m  pts={len(lo_group)}")
             walls.append({"gradient": gradient, "offset": offset})
 
         hi_group = vals[vals >= v_max - WALL_TOL]
         if len(hi_group) >= MIN_WALL_POINTS:
             offset = round(float(np.median(hi_group)), 3)
-            print(f"  [WALLS] {label_hi:6s}  offset={offset:+.3f} m  pts={len(hi_group)}")
+            if DEBUG:
+                print(f"  [WALLS] {label_hi:6s}  offset={offset:+.3f} m  pts={len(hi_group)}")
             walls.append({"gradient": gradient, "offset": offset})
 
     return walls
@@ -92,16 +98,15 @@ def on_update(key, value):
         except (json.JSONDecodeError, TypeError, ValueError):
             return
 
-        fa = _heading()
-        print(f"[WALLS] heading={fa:.1f}°  points={len(_lidar)}")
-
         with _perf.measure("lidar"):
             pts = _lidar_to_cartesian()
             if pts is None:
                 return
 
             walls = _detect_walls(pts)
-            print(f"  [WALLS] {len(walls)} wall(s) detected")
+            if DEBUG:
+                print(f"[WALLS] heading={_heading():.1f}°  points={len(_lidar)}"
+                      f"  → {len(walls)} wall(s)")
             mb.set("lidar_walls", json.dumps(walls))
 
 

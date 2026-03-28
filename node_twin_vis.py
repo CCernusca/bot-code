@@ -24,16 +24,11 @@ _perf = PerfMonitor("node_twin_vis", broker=mb, print_every=50)
 # ── Broker state ──────────────────────────────────────────────────────────────
 _lidar             = {}
 _detection_origin  = None
-_detection_heading = None
+_detection_heading = None  # radians
 _imu_pitch         = None
 _robot_pos         = None
 _other_robots      = []
-_corners           = []
-_wall_corners      = []
-_wall_corners_hist = []
-_walls             = []
-_walls_hist        = []
-_positioning_corner   = None
+_walls                = []
 _position_history     = []
 _other_robots_history = []
 
@@ -66,6 +61,10 @@ ax.add_patch(patches.Rectangle(
 ))
 
 # ── Pre-allocated animated artists ───────────────────────────────────────────
+
+# Lidar scatter
+# Pre-cached tab10 palette — avoids a colormap call every robot every frame
+_TAB10 = [tuple(plt.cm.tab10(i)[:3]) for i in range(10)]
 
 # Lidar scatter
 _art_lidar = ax.scatter([], [], s=5, c='#222222', zorder=10, animated=True)
@@ -104,8 +103,7 @@ def _wall_line(color, ls):
         zorder=4, animated=True, visible=False)
     return ln
 
-_art_walls      = [_wall_line('steelblue',   '--') for _ in range(_MAX_WALLS)]
-_art_walls_hist = [_wall_line('mediumpurple', ':' ) for _ in range(_MAX_WALLS)]
+_art_walls = [_wall_line('steelblue', '--') for _ in range(_MAX_WALLS)]
 
 # Position history scatter
 _art_pos_hist = ax.scatter([], [], s=18, zorder=5, animated=True,
@@ -164,7 +162,7 @@ def _redraw():
     # ── Lidar ─────────────────────────────────────────────────────────────────
     if _lidar:
         lo    = _detection_origin if _detection_origin is not None else origin
-        lh    = math.radians(_detection_heading) if _detection_heading is not None else fa_rad
+        lh    = _detection_heading if _detection_heading is not None else fa_rad
         angs  = np.radians(list(_lidar.keys())) + lh
         dists = np.array(list(_lidar.values())) / 1000.0
         _art_lidar.set_offsets(np.column_stack((
@@ -189,7 +187,7 @@ def _redraw():
             method    = str(r[2]) if len(r) > 2 else ""
             rid       = int(r[3]) if len(r) > 3 else 0
             predicted = method == "predicted"
-            c_solid   = tuple(plt.cm.tab10((rid - 1) % 10)[:3])
+            c_solid   = _TAB10[(rid - 1) % 10]
             c_face    = c_solid + (0.15 if predicted else 0.3,)
             circ.set_center((ox, oy))
             circ.set_edgecolor(c_solid)
@@ -215,18 +213,15 @@ def _redraw():
     _art_arrow.set_visible(True)
 
     # ── Walls ─────────────────────────────────────────────────────────────────
-    _update_wall_lines(_walls,      _art_walls,      origin)
-    _update_wall_lines(_walls_hist, _art_walls_hist, origin)
+    _update_wall_lines(_walls, _art_walls, origin)
 
     # ── Position history ──────────────────────────────────────────────────────
     if known_pos and len(_position_history) > 1:
-        t0   = _position_history[0]["t"]
-        rng  = max(_position_history[-1]["t"] - t0, 1e-9)
-        xs   = [p["x"] for p in _position_history]
-        ys   = [p["y"] for p in _position_history]
-        rgba = [(0.4, 0.4, 0.4, 0.05 + 0.7 * (p["t"] - t0) / rng)
-                for p in _position_history]
-        _art_pos_hist.set_offsets(np.column_stack((xs, ys)))
+        arr   = np.array([(p["x"], p["y"], p["t"]) for p in _position_history])
+        t0    = arr[0, 2];  rng = max(arr[-1, 2] - t0, 1e-9)
+        alpha = 0.05 + 0.7 * (arr[:, 2] - t0) / rng
+        rgba  = np.column_stack([np.full((len(arr), 3), [0.4, 0.4, 0.4]), alpha])
+        _art_pos_hist.set_offsets(arr[:, :2])
         _art_pos_hist.set_facecolors(rgba)
     else:
         _art_pos_hist.set_offsets(np.empty((0, 2)))
@@ -239,7 +234,7 @@ def _redraw():
         for snap in _other_robots_history:
             alpha = 0.05 + 0.6 * (snap["t"] - t0) / rng
             for r in snap["robots"]:
-                c = tuple(plt.cm.tab10((int(r.get("id", 0)) - 1) % 10)[:3])
+                c = _TAB10[(int(r.get("id", 0)) - 1) % 10]
                 pts.append((r["x"], r["y"]))
                 rgba.append(c + (alpha,))
         if pts:
@@ -263,7 +258,7 @@ def _redraw():
         _art_lidar,
         _art_self, *_art_bots, *_art_blbls,
         _art_arrow,
-        *_art_walls, *_art_walls_hist,
+        *_art_walls,
         _art_pos_hist, _art_bot_hist,
         _art_status,
     ]:
@@ -274,8 +269,7 @@ def _redraw():
 # ── Broker callbacks ──────────────────────────────────────────────────────────
 def on_update(key, value):
     global _lidar, _detection_origin, _detection_heading, _imu_pitch
-    global _robot_pos, _other_robots, _corners, _wall_corners, _wall_corners_hist
-    global _walls, _walls_hist, _positioning_corner
+    global _robot_pos, _other_robots, _walls
     global _position_history, _other_robots_history
 
     if value is None:
@@ -301,7 +295,7 @@ def on_update(key, value):
                     if orig:
                         _detection_origin  = (float(orig["x"]), float(orig["y"]))
                         if "heading" in orig:
-                            _detection_heading = float(orig["heading"])
+                            _detection_heading = math.radians(float(orig["heading"]))
                     robot_list = payload.get("robots", [])
                 else:
                     robot_list = payload
@@ -309,23 +303,8 @@ def on_update(key, value):
                                    r.get("method", ""), int(r.get("id", 0))]
                                   for r in robot_list]
 
-            elif key == "depth_corners":
-                _corners = json.loads(value)
-
-            elif key == "wall_corners":
-                _wall_corners = json.loads(value)
-
-            elif key == "wall_corners_hist":
-                _wall_corners_hist = json.loads(value)
-
-            elif key == "positioning_corner":
-                _positioning_corner = json.loads(value)
-
             elif key == "lidar_walls":
                 _walls = json.loads(value)
-
-            elif key == "lidar_walls_hist":
-                _walls_hist = json.loads(value)
 
             elif key == "position_history":
                 _position_history = json.loads(value)
@@ -342,32 +321,22 @@ def on_update(key, value):
 
 if __name__ == "__main__":
     _SEEDS = {
-        "imu_pitch":          lambda v: float(v),
-        "lidar":              lambda v: {int(k): int(x) for k, x in json.loads(v).items()},
-        "robot_position":     lambda v: (float(json.loads(v)["x"]), float(json.loads(v)["y"])),
-        "other_robots":       lambda v: [[float(r["x"]), float(r["y"]), r.get("method", ""), int(r.get("id", 0))]
-                                          for r in (lambda p: p.get("robots", p) if isinstance(p, dict) else p)(json.loads(v))],
-        "depth_corners":      lambda v: json.loads(v),
-        "wall_corners":       lambda v: json.loads(v),
-        "wall_corners_hist":  lambda v: json.loads(v),
-        "positioning_corner": lambda v: json.loads(v),
-        "lidar_walls":        lambda v: json.loads(v),
-        "lidar_walls_hist":   lambda v: json.loads(v),
-        "position_history":   lambda v: json.loads(v),
+        "imu_pitch":            lambda v: float(v),
+        "lidar":                lambda v: {int(k): int(x) for k, x in json.loads(v).items()},
+        "robot_position":       lambda v: (float(json.loads(v)["x"]), float(json.loads(v)["y"])),
+        "other_robots":         lambda v: [[float(r["x"]), float(r["y"]), r.get("method", ""), int(r.get("id", 0))]
+                                            for r in (lambda p: p.get("robots", p) if isinstance(p, dict) else p)(json.loads(v))],
+        "lidar_walls":          lambda v: json.loads(v),
+        "position_history":     lambda v: json.loads(v),
         "other_robots_history": lambda v: json.loads(v),
     }
     _TARGETS = {
-        "imu_pitch":          "_imu_pitch",
-        "lidar":              "_lidar",
-        "robot_position":     "_robot_pos",
-        "other_robots":       "_other_robots",
-        "depth_corners":      "_corners",
-        "wall_corners":       "_wall_corners",
-        "wall_corners_hist":  "_wall_corners_hist",
-        "positioning_corner": "_positioning_corner",
-        "lidar_walls":        "_walls",
-        "lidar_walls_hist":   "_walls_hist",
-        "position_history":   "_position_history",
+        "imu_pitch":            "_imu_pitch",
+        "lidar":                "_lidar",
+        "robot_position":       "_robot_pos",
+        "other_robots":         "_other_robots",
+        "lidar_walls":          "_walls",
+        "position_history":     "_position_history",
         "other_robots_history": "_other_robots_history",
     }
     for key, parse in _SEEDS.items():

@@ -34,6 +34,8 @@ VEL_HISTORY_N   = 10     # rolling history length per tracked robot
 VEL_HISTORY_MIN = 3      # minimum samples before fitted velocity is trusted
 MAX_ROBOT_SPEED = 2.0    # m/s — hard cap after fitting
 
+DEBUG = False   # set True to print per-scan detection results
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
@@ -126,9 +128,9 @@ def _fit_velocity(history):
     ts  = arr[:, 0] - arr[0, 0]
     if ts[-1] < 1e-9:
         return 0.0, 0.0
-    vx = float(np.polyfit(ts, arr[:, 1], 1)[0])
-    vy = float(np.polyfit(ts, arr[:, 2], 1)[0])
-    return vx, vy
+    # Single LAPACK solve for both axes at once; coeffs[0] = [vx_slope, vy_slope]
+    coeffs = np.polyfit(ts, arr[:, 1:3], 1)
+    return float(coeffs[0, 0]), float(coeffs[0, 1])
 
 
 # ── ID tracking ───────────────────────────────────────────────────────────────
@@ -282,11 +284,12 @@ def _detect_robots():
     robots = _filter_overlapping(robots)[:MAX_ROBOTS]
     robots = _match_and_track(robots, now)
 
-    for r in robots:
-        print(f"  [ROBOTS] id={r['id']}  {r['pts']:2d} pts"
-              f"  ({r['x']:.3f}, {r['y']:.3f})"
-              f"  conf={r['confidence']:.2f}  [{r['method']}]"
-              f"  v=({r['vx']:.2f}, {r['vy']:.2f})")
+    if DEBUG:
+        for r in robots:
+            print(f"  [ROBOTS] id={r['id']}  {r['pts']:2d} pts"
+                  f"  ({r['x']:.3f}, {r['y']:.3f})"
+                  f"  conf={r['confidence']:.2f}  [{r['method']}]"
+                  f"  v=({r['vx']:.2f}, {r['vy']:.2f})")
 
     origin = {"x": round(rx, 4), "y": round(ry, 4), "heading": round(math.degrees(fa_rad), 3)}
     return robots, origin

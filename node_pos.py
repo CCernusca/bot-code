@@ -2,6 +2,7 @@ from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
 import json
 import math
+import numpy as np
 
 # ── Field configuration ────────────────────────────────────────────────────────
 FIELD_WIDTH  = 1.82   # metres, X axis
@@ -14,6 +15,8 @@ _MARGIN            = 0.05   # metres
 _OUTLIER_THRESHOLD = 0.15   # metres
 # How far outside the field boundary a lidar point may land.
 _LIDAR_FIELD_TOL   = 0.05   # metres
+
+DEBUG = False   # set True to print per-update positioning details
 # ──────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
@@ -46,17 +49,18 @@ def _compute_position():
 
     eff_angle = _heading()
     fa_rad    = math.radians(eff_angle)
-    print(f"[POS] heading={eff_angle:.1f}°  walls={len(_lidar_walls)}")
 
     # ── Lidar bounding box (field-aligned, robot-centred) ─────────────────────
     lidar_min_x = lidar_max_x = lidar_min_y = lidar_max_y = 0.0
     if _lidar:
-        offsets_x = [d / 1000.0 * math.cos(math.radians(a) + fa_rad)
-                     for a, d in _lidar.items()]
-        offsets_y = [d / 1000.0 * math.sin(math.radians(a) + fa_rad)
-                     for a, d in _lidar.items()]
-        lidar_min_x, lidar_max_x = min(offsets_x), max(offsets_x)
-        lidar_min_y, lidar_max_y = min(offsets_y), max(offsets_y)
+        n     = len(_lidar)
+        keys, vals = zip(*_lidar.items())
+        a_arr = np.radians(np.array(keys, dtype=float)) + fa_rad
+        d_arr = np.array(vals, dtype=float) / 1000.0
+        ox = d_arr * np.cos(a_arr)
+        oy = d_arr * np.sin(a_arr)
+        lidar_min_x, lidar_max_x = float(ox.min()), float(ox.max())
+        lidar_min_y, lidar_max_y = float(oy.min()), float(oy.max())
 
     # ── Generate axis candidates ───────────────────────────────────────────────
     x_candidates = []
@@ -75,7 +79,6 @@ def _compute_position():
                     rx + lidar_max_x <= FIELD_WIDTH + _LIDAR_FIELD_TOL
                 ):
                     continue
-                print(f"  [POS] x={rx:.3f}")
                 x_candidates.append(rx)
 
         else:  # horizontal wall → constrains y
@@ -87,11 +90,11 @@ def _compute_position():
                     ry + lidar_max_y <= FIELD_HEIGHT + _LIDAR_FIELD_TOL
                 ):
                     continue
-                print(f"  [POS] y={ry:.3f}")
                 y_candidates.append(ry)
 
     if not x_candidates or not y_candidates:
-        print("  [POS] No valid candidates.")
+        if DEBUG:
+            print(f"[POS] heading={eff_angle:.1f}°  walls={len(_lidar_walls)}  → no valid candidates")
         return None
 
     def _best(candidates):
@@ -101,7 +104,9 @@ def _compute_position():
 
     rx = _best(x_candidates)
     ry = _best(y_candidates)
-    print(f"  [POS] pos=({rx:.3f}, {ry:.3f}) m")
+    if DEBUG:
+        print(f"[POS] heading={eff_angle:.1f}°  walls={len(_lidar_walls)}"
+              f"  → pos=({rx:.3f}, {ry:.3f}) m")
     return round(rx, 3), round(ry, 3)
 
 
