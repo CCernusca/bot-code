@@ -63,14 +63,14 @@ def _process_frame(frame):
 
     if not contours:
         return {"command": "NO_BALL", "distance_cm": 0.0,
-                "x_center": -1, "radius": -1}
+                "angle_deg": 0.0, "x_center": -1, "radius": -1}
 
     largest = max(contours, key=cv2.contourArea)
     (x_center, _), radius = cv2.minEnclosingCircle(largest)
 
     if radius <= MIN_RADIUS:
         return {"command": "NO_BALL", "distance_cm": 0.0,
-                "x_center": -1, "radius": -1}
+                "angle_deg": 0.0, "x_center": -1, "radius": -1}
 
     # ── Distance estimate via angular diameter ─────────────────────────────────
     # The ball subtends an angle of Ow_deg degrees in the image.
@@ -80,8 +80,13 @@ def _process_frame(frame):
     Ow_rad = math.radians(Ow_deg)
     distance_cm = (BALL_RADIUS_MM / math.tan(Ow_rad / 2.0)) / 10.0 if Ow_rad > 0 else 0.0
 
+    # ── Angle to ball (horizontal) ─────────────────────────────────────────────
+    # Map pixel offset from centre to degrees using the horizontal FOV.
+    # Positive = ball is to the right, negative = ball is to the left.
+    error_x   = x_center - CENTER_X
+    angle_deg = (error_x / RES_WIDTH) * FOV_DEG
+
     # ── Steering command ───────────────────────────────────────────────────────
-    error_x = x_center - CENTER_X
     if error_x < -DEADZONE_PIXELS:
         command = "LEFT"
     elif error_x > DEADZONE_PIXELS:
@@ -92,6 +97,7 @@ def _process_frame(frame):
     return {
         "command":     command,
         "distance_cm": round(distance_cm, 1),
+        "angle_deg":   round(angle_deg, 1),
         "x_center":    round(float(x_center), 1),
         "radius":      round(float(radius), 1),
     }
@@ -133,7 +139,8 @@ if __name__ == "__main__":
                     print("[VISION] Status: NO BALL")
                 else:
                     print(f"[VISION] Status: {result['command']} | "
-                          f"Distance: {result['distance_cm']:.1f} cm")
+                          f"Distance: {result['distance_cm']:.1f} cm | "
+                          f"Angle: {result['angle_deg']:.1f} deg")
                 last_log_time = now
 
     except KeyboardInterrupt:
