@@ -32,6 +32,10 @@ _walls                = []
 _position_history     = []
 _other_robots_history = []
 _ball_pos             = None  # {"x": float, "y": float} or None — detected position
+_ball_vx              = None  # m/s — fitted horizontal velocity
+_ball_vy              = None  # m/s — fitted vertical velocity
+_ball_predicted_pos   = None  # {"x": float, "y": float} or None — predicted position
+_ball_history         = []    # [{"x", "y", "t"}, ...] from ball_history key
 _sim_ball_pos         = None  # {"x": float, "y": float} or None — true sim position
 _sim_state            = None  # {"robot": [x,y], "obstacles": [[x,y],...]} from sim_state key
 
@@ -122,6 +126,21 @@ _art_ball = patches.Circle((0, 0), _BALL_RADIUS,
     lw=1.5, edgecolor='darkorange', facecolor='orange',
     zorder=9, animated=True, visible=False)
 ax.add_patch(_art_ball)
+
+# Ball history scatter
+_art_ball_hist = ax.scatter([], [], s=14, zorder=5, animated=True, edgecolors='none')
+
+# Ball velocity arrow
+_art_ball_arrow = FancyArrowPatch((0, 0), (0.1, 0),
+    arrowstyle='->', color='darkorange', lw=1.5, mutation_scale=10,
+    zorder=9, animated=True, visible=False)
+ax.add_patch(_art_ball_arrow)
+
+# Ball predicted position — dashed ghost circle
+_art_ball_pred = patches.Circle((0, 0), _BALL_RADIUS,
+    lw=1.5, edgecolor='darkorange', facecolor='none', ls='--',
+    zorder=8, animated=True, visible=False)
+ax.add_patch(_art_ball_pred)
 
 # Sim ground-truth crosses (shown alongside the detected circles).
 # Use Line2D (plot) rather than scatter — simpler blitting semantics,
@@ -241,6 +260,36 @@ def _redraw():
     else:
         _art_ball.set_visible(False)
 
+    # ── Ball history trail ────────────────────────────────────────────────────
+    if len(_ball_history) > 1:
+        arr   = np.array([(p["x"], p["y"], p["t"]) for p in _ball_history])
+        t0    = arr[0, 2];  rng = max(arr[-1, 2] - t0, 1e-9)
+        alpha = 0.05 + 0.7 * (arr[:, 2] - t0) / rng
+        rgba  = np.column_stack([np.full((len(arr), 3), [1.0, 0.55, 0.0]), alpha])
+        _art_ball_hist.set_offsets(arr[:, :2])
+        _art_ball_hist.set_facecolors(rgba)
+    else:
+        _art_ball_hist.set_offsets(np.empty((0, 2)))
+
+    # ── Ball velocity arrow ───────────────────────────────────────────────────
+    if (_ball_pos is not None and _ball_vx is not None and _ball_vy is not None
+            and math.hypot(_ball_vx, _ball_vy) > 0.1):
+        bx, by = _ball_pos["x"], _ball_pos["y"]
+        _art_ball_arrow.set_positions(
+            (bx, by),
+            (bx + _ball_vx * 0.5, by + _ball_vy * 0.5),
+        )
+        _art_ball_arrow.set_visible(True)
+    else:
+        _art_ball_arrow.set_visible(False)
+
+    # ── Ball predicted position ───────────────────────────────────────────────
+    if _ball_predicted_pos is not None:
+        _art_ball_pred.set_center((_ball_predicted_pos["x"], _ball_predicted_pos["y"]))
+        _art_ball_pred.set_visible(True)
+    else:
+        _art_ball_pred.set_visible(False)
+
     # ── Sim ground-truth crosses ───────────────────────────────────────────────
     if _sim_ball_pos is not None:
         _art_sim_ball.set_data([_sim_ball_pos["x"]], [_sim_ball_pos["y"]])
@@ -304,7 +353,7 @@ def _redraw():
         _art_lidar,
         _art_self, *_art_bots, *_art_blbls,
         _art_arrow,
-        _art_ball,
+        _art_ball, _art_ball_hist, _art_ball_arrow, _art_ball_pred,
         _art_sim_ball, _art_sim_self, *_art_sim_obs,
         *_art_walls,
         _art_pos_hist, _art_bot_hist,
@@ -319,7 +368,8 @@ def on_update(key, value):
     global _lidar, _detection_origin, _detection_heading, _imu_pitch
     global _robot_pos, _other_robots, _walls
     global _position_history, _other_robots_history
-    global _ball_pos, _sim_ball_pos, _sim_state
+    global _ball_pos, _ball_vx, _ball_vy, _ball_predicted_pos, _ball_history
+    global _sim_ball_pos, _sim_state
 
     if value is None:
         return
@@ -362,9 +412,15 @@ def on_update(key, value):
                 _other_robots_history = json.loads(value)
 
             elif key == "ball":
-                payload = json.loads(value)
-                _ball_pos     = payload.get("global_pos")
-                _sim_ball_pos = payload.get("sim_pos")
+                payload           = json.loads(value)
+                _ball_pos         = payload.get("global_pos")
+                _ball_vx          = payload.get("vx")
+                _ball_vy          = payload.get("vy")
+                _ball_predicted_pos = payload.get("predicted_pos")
+                _sim_ball_pos     = payload.get("sim_pos")
+
+            elif key == "ball_history":
+                _ball_history = json.loads(value)
 
             elif key == "sim_state":
                 _sim_state = json.loads(value)
@@ -387,6 +443,7 @@ if __name__ == "__main__":
         "position_history":     lambda v: json.loads(v),
         "other_robots_history": lambda v: json.loads(v),
         "ball":                 lambda v: json.loads(v).get("global_pos"),
+        "ball_history":         lambda v: json.loads(v),
         "sim_state":            lambda v: json.loads(v),
     }
     _TARGETS = {
@@ -398,6 +455,7 @@ if __name__ == "__main__":
         "position_history":     "_position_history",
         "other_robots_history": "_other_robots_history",
         "ball":                 "_ball_pos",
+        "ball_history":         "_ball_history",
         "sim_state":            "_sim_state",
     }
     for key, parse in _SEEDS.items():

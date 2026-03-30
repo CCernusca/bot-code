@@ -2,6 +2,7 @@ from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
 import json
 import math
+import numpy as np
 import threading
 import time
 
@@ -26,6 +27,17 @@ BALL_RADIUS_MM = 21.0  # Real-world ball radius in mm (used for distance calc)
 # ── Robot geometry ────────────────────────────────────────────────────────────
 ROBOT_RADIUS = 0.09   # metres — camera sits one radius ahead of the robot centre
 
+# ── Field dimensions (for velocity prediction bounce) ─────────────────────────
+FIELD_WIDTH  = 1.82
+FIELD_HEIGHT = 2.43
+
+# ── Ball velocity tracking ────────────────────────────────────────────────────
+BALL_VEL_HISTORY_N   = 10    # rolling history length
+BALL_VEL_HISTORY_MIN = 3     # minimum samples before velocity is trusted
+BALL_VEL_MIN_DT      = 0.05  # seconds — min elapsed time between history samples
+MAX_BALL_SPEED       = 3.0   # m/s — hard cap after fitting
+BALL_PREDICT_T       = 1.0   # seconds — prediction horizon
+
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball"
 
@@ -40,10 +52,14 @@ _robot_pos = None   # (x, y) metres — from robot_position broker key
 _imu_pitch = None   # degrees       — from imu_pitch broker key
 _sim_state = None   # {"robot": [x,y], "obstacles": [[x,y],...]} — from sim_state broker key
 
+# ── Ball velocity state (main-loop only, no lock needed) ──────────────────────
+_vel_history      = []      # [[t, x, y], ...] — recent global_pos samples
+_vel_last_t       = -999.0  # monotonic time of last history sample
+_last_detection_t = -999.0  # monotonic time of last successful detection
+
 _hw_available = False
 try:
     import cv2
-    import numpy as np
     _hw_available = True
 except ImportError as e:
     print(f"[VISION] OpenCV not available ({e}) — node will not run.")
@@ -282,6 +298,38 @@ class _SimBall:
         return {"x": round(self._x, 3), "y": round(self._y, 3)}
 
 
+def _fit_ball_velocity(history):
+    """
+    Linear velocity fit over [[t, x, y], ...] history.
+    Returns (vx, vy) in m/s, or (0.0, 0.0) if insufficient data.
+    """
+    if len(history) < BALL_VEL_HISTORY_MIN:
+        return 0.0, 0.0
+    arr = np.array(history, dtype=float)
+    ts  = arr[:, 0] - arr[0, 0]
+    if ts[-1] < 1e-9:
+        return 0.0, 0.0
+    coeffs = np.polyfit(ts, arr[:, 1:3], 1)
+    return float(coeffs[0, 0]), float(coeffs[0, 1])
+
+
+def _predict_ball(x, y, vx, vy):
+    """
+    Predict ball position after BALL_PREDICT_T seconds, bouncing off field walls.
+    """
+    r    = BALL_RADIUS_MM / 1000.0
+    dt   = BALL_PREDICT_T
+    n    = max(1, min(int(dt / 0.02) + 1, 100))
+    step = dt / n
+    for _ in range(n):
+        x += vx * step;  y += vy * step
+        if   x < r:                    x = r;                    vx =  abs(vx)
+        elif x > FIELD_WIDTH  - r:     x = FIELD_WIDTH  - r;     vx = -abs(vx)
+        if   y < r:                    y = r;                    vy =  abs(vy)
+        elif y > FIELD_HEIGHT - r:     y = FIELD_HEIGHT - r;     vy = -abs(vy)
+    return round(x, 3), round(y, 3)
+
+
 def _on_broker_update(key, value):
     global _robot_pos, _imu_pitch, _sim_state
     if value is None:
@@ -389,13 +437,45 @@ if __name__ == "__main__":
                     break
 
             with _perf.measure("frame"):
+                now_t  = time.monotonic()
                 result = _process_frame(frame)
+
+                gpos = None
                 if result["command"] != "NO_BALL":
-                    result["global_pos"] = _compute_global_pos(
-                        result["distance_cm"], result["angle_deg"]
-                    )
+                    gpos = _compute_global_pos(result["distance_cm"], result["angle_deg"])
+
+                result["global_pos"] = gpos
+
+                # ── Velocity tracking ────────────────────────────────────────
+                ball_vx, ball_vy, ball_pred = 0.0, 0.0, None
+
+                if gpos is not None:
+                    _last_detection_t = now_t
+                    if now_t - _vel_last_t >= BALL_VEL_MIN_DT:
+                        _vel_history.append([now_t, gpos["x"], gpos["y"]])
+                        if len(_vel_history) > BALL_VEL_HISTORY_N:
+                            _vel_history.pop(0)
+                        _vel_last_t = now_t
                 else:
-                    result["global_pos"] = None
+                    # Clear stale history after ball has been absent for 1 second
+                    if now_t - _last_detection_t > 1.0:
+                        _vel_history.clear()
+                        _vel_last_t = -999.0
+
+                if len(_vel_history) >= BALL_VEL_HISTORY_MIN:
+                    ball_vx, ball_vy = _fit_ball_velocity(_vel_history)
+                    spd = math.hypot(ball_vx, ball_vy)
+                    if spd > MAX_BALL_SPEED:
+                        ball_vx *= MAX_BALL_SPEED / spd
+                        ball_vy *= MAX_BALL_SPEED / spd
+                    if gpos is not None:
+                        px, py = _predict_ball(gpos["x"], gpos["y"], ball_vx, ball_vy)
+                        ball_pred = {"x": px, "y": py}
+
+                result["vx"]            = round(ball_vx, 3)
+                result["vy"]            = round(ball_vy, 3)
+                result["predicted_pos"] = ball_pred
+
                 if sim is not None:
                     result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
