@@ -276,6 +276,11 @@ class _SimBall:
         cv2.circle(frame, (px, RES_HEIGHT // 2), radius_px, self._orange_bgr, -1)
         return frame
 
+    @property
+    def pos(self):
+        """True ball position in global field coordinates (metres)."""
+        return {"x": round(self._x, 3), "y": round(self._y, 3)}
+
 
 def _on_broker_update(key, value):
     global _robot_pos, _imu_pitch, _sim_state
@@ -391,6 +396,8 @@ if __name__ == "__main__":
                     )
                 else:
                     result["global_pos"] = None
+                if sim is not None:
+                    result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
 
             # Log to console at most once per second

@@ -31,7 +31,9 @@ _other_robots      = []
 _walls                = []
 _position_history     = []
 _other_robots_history = []
-_ball_pos             = None  # {"x": float, "y": float} or None
+_ball_pos             = None  # {"x": float, "y": float} or None — detected position
+_sim_ball_pos         = None  # {"x": float, "y": float} or None — true sim position
+_sim_state            = None  # {"robot": [x,y], "obstacles": [[x,y],...]} from sim_state key
 
 _state_lock   = threading.Lock()
 _needs_redraw = threading.Event()
@@ -114,12 +116,25 @@ _art_pos_hist = ax.scatter([], [], s=18, zorder=5, animated=True,
 _art_bot_hist = ax.scatter([], [], s=18, zorder=5, animated=True,
                             edgecolors='none')
 
-# Ball
+# Ball — filled circle for detected position, cross for true sim position
 _BALL_RADIUS = 0.021   # metres (21 mm physical radius)
 _art_ball = patches.Circle((0, 0), _BALL_RADIUS,
     lw=1.5, edgecolor='darkorange', facecolor='orange',
     zorder=9, animated=True, visible=False)
 ax.add_patch(_art_ball)
+
+# Sim ground-truth crosses (shown alongside the detected circles)
+_SIM_CROSS_S  = 120   # marker size for all sim crosses
+_SIM_CROSS_LW = 2.0   # line width
+_art_sim_ball = ax.scatter([], [], s=_SIM_CROSS_S, marker='+', zorder=8,
+    color='darkorange', linewidths=_SIM_CROSS_LW, animated=True)
+_art_sim_self = ax.scatter([], [], s=_SIM_CROSS_S, marker='+', zorder=8,
+    color='#555555', linewidths=_SIM_CROSS_LW, animated=True)
+_art_sim_obs  = [
+    ax.scatter([], [], s=_SIM_CROSS_S, marker='+', zorder=8,
+        color=_TAB10[i], linewidths=_SIM_CROSS_LW, animated=True)
+    for i in range(3)   # sim always spawns exactly 3 obstacles
+]
 
 # Status text (inside axes, top-left corner)
 _art_status = ax.text(0.01, 0.99, '', transform=ax.transAxes,
@@ -227,6 +242,24 @@ def _redraw():
     else:
         _art_ball.set_visible(False)
 
+    # ── Sim ground-truth crosses ───────────────────────────────────────────────
+    if _sim_ball_pos is not None:
+        _art_sim_ball.set_offsets([[_sim_ball_pos["x"], _sim_ball_pos["y"]]])
+    else:
+        _art_sim_ball.set_offsets(np.empty((0, 2)))
+
+    if _sim_state is not None:
+        r = _sim_state.get("robot")
+        _art_sim_self.set_offsets([[float(r[0]), float(r[1])]] if r else np.empty((0, 2)))
+        obs = _sim_state.get("obstacles", [])
+        for i, art in enumerate(_art_sim_obs):
+            art.set_offsets([[float(obs[i][0]), float(obs[i][1])]] if i < len(obs)
+                            else np.empty((0, 2)))
+    else:
+        _art_sim_self.set_offsets(np.empty((0, 2)))
+        for art in _art_sim_obs:
+            art.set_offsets(np.empty((0, 2)))
+
     # ── Walls ─────────────────────────────────────────────────────────────────
     _update_wall_lines(_walls, _art_walls, origin)
 
@@ -274,6 +307,7 @@ def _redraw():
         _art_self, *_art_bots, *_art_blbls,
         _art_arrow,
         _art_ball,
+        _art_sim_ball, _art_sim_self, *_art_sim_obs,
         *_art_walls,
         _art_pos_hist, _art_bot_hist,
         _art_status,
@@ -286,7 +320,8 @@ def _redraw():
 def on_update(key, value):
     global _lidar, _detection_origin, _detection_heading, _imu_pitch
     global _robot_pos, _other_robots, _walls
-    global _position_history, _other_robots_history, _ball_pos
+    global _position_history, _other_robots_history
+    global _ball_pos, _sim_ball_pos, _sim_state
 
     if value is None:
         return
@@ -330,7 +365,11 @@ def on_update(key, value):
 
             elif key == "ball":
                 payload = json.loads(value)
-                _ball_pos = payload.get("global_pos")
+                _ball_pos     = payload.get("global_pos")
+                _sim_ball_pos = payload.get("sim_pos")
+
+            elif key == "sim_state":
+                _sim_state = json.loads(value)
 
     except Exception as e:
         print(f"[VIS] parse error on {key!r}: {e}")
@@ -350,6 +389,7 @@ if __name__ == "__main__":
         "position_history":     lambda v: json.loads(v),
         "other_robots_history": lambda v: json.loads(v),
         "ball":                 lambda v: json.loads(v).get("global_pos"),
+        "sim_state":            lambda v: json.loads(v),
     }
     _TARGETS = {
         "imu_pitch":            "_imu_pitch",
@@ -360,6 +400,7 @@ if __name__ == "__main__":
         "position_history":     "_position_history",
         "other_robots_history": "_other_robots_history",
         "ball":                 "_ball_pos",
+        "sim_state":            "_sim_state",
     }
     for key, parse in _SEEDS.items():
         try:
