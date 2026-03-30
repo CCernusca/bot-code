@@ -509,7 +509,6 @@ if __name__ == "__main__":
                 result["global_pos"] = gpos
 
                 # ── Velocity tracking ────────────────────────────────────────
-                global _last_ball_x, _last_ball_y, _last_ball_vx, _last_ball_vy
                 ball_vx, ball_vy, ball_pred, hidden_pos = 0.0, 0.0, None, None
 
                 if gpos is not None:
