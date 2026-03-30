@@ -36,7 +36,6 @@ BALL_VEL_HISTORY_N   = 10    # rolling history length
 BALL_VEL_HISTORY_MIN = 3     # minimum samples before velocity is trusted
 BALL_VEL_MIN_DT      = 0.05  # seconds — min elapsed time between history samples
 MAX_BALL_SPEED            = 3.0  # m/s — hard cap after fitting
-BALL_PREDICT_MAX_BOUNCES  = 8    # stop prediction after this many wall bounces
 
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball"
@@ -320,76 +319,61 @@ def _fit_ball_velocity(history):
     return float(coeffs[0, 0]), float(coeffs[0, 1])
 
 
-def _extrapolate_ball(x, y, vx, vy, dt):
+def _extrapolate_ball(x, y, vx, vy, dt, robots=None):
     """
-    Advance ball position analytically by dt seconds, bouncing off field walls.
-    Used to estimate the current position when the ball is temporarily hidden.
-    """
-    r    = BALL_RADIUS_MM / 1000.0
-    lo_x, hi_x = r, FIELD_WIDTH  - r
-    lo_y, hi_y = r, FIELD_HEIGHT - r
+    Step-based physics simulation advancing the ball by dt seconds.
 
-    remaining = dt
-    for _ in range(10000):          # safety guard — each iteration handles one bounce
-        if remaining <= 1e-9:
-            break
-        tx = (hi_x - x) / vx if vx > 1e-9 else ((lo_x - x) / vx if vx < -1e-9 else math.inf)
-        ty = (hi_y - y) / vy if vy > 1e-9 else ((lo_y - y) / vy if vy < -1e-9 else math.inf)
-        t_wall = min(tx, ty)
-        if not math.isfinite(t_wall) or t_wall > remaining:
-            x += vx * remaining
-            y += vy * remaining
-            break
-        x += vx * t_wall
-        y += vy * t_wall
-        remaining -= t_wall
-        if tx <= ty:
-            x  = hi_x if vx > 0 else lo_x
-            vx = -vx
-        if ty <= tx:
-            y  = hi_y if vy > 0 else lo_y
-            vy = -vy
+    Handles elastic bounces off field walls and circular robot bodies
+    (same mechanics as _SimBall).  Used to estimate the current ball
+    position when it is temporarily hidden from the camera.
+
+    robots: list of (rx, ry) robot centres in metres, or None.
+    """
+    STEP = 0.02                        # 20 ms per step
+    r    = BALL_RADIUS_MM / 1000.0
+    sep  = ROBOT_RADIUS + r            # ball-centre to robot-centre at contact
+
+    n    = max(1, round(dt / STEP))
+    step = dt / n
+
+    for _ in range(n):
+        x += vx * step
+        y += vy * step
+
+        # ── Wall bounces ──────────────────────────────────────────────────────
+        if   x < r:                x = r;                vx =  abs(vx)
+        elif x > FIELD_WIDTH  - r: x = FIELD_WIDTH  - r; vx = -abs(vx)
+        if   y < r:                y = r;                vy =  abs(vy)
+        elif y > FIELD_HEIGHT - r: y = FIELD_HEIGHT - r; vy = -abs(vy)
+
+        # ── Elastic bounces off robot bodies ──────────────────────────────────
+        if robots:
+            for rx, ry in robots:
+                dx, dy = x - rx, y - ry
+                dist   = math.hypot(dx, dy)
+                if 0 < dist < sep:
+                    nx, ny = dx / dist, dy / dist
+                    x, y   = rx + nx * sep, ry + ny * sep
+                    dot    = vx * nx + vy * ny
+                    if dot < 0:
+                        vx -= 2 * dot * nx
+                        vy -= 2 * dot * ny
+
     return round(x, 3), round(y, 3)
 
 
-def _predict_ball_path(x, y, vx, vy):
-    """
-    Analytical wall-bounce trajectory — no fixed time horizon.
-
-    Returns a list of [x, y] waypoints: the starting position plus every
-    wall-intersection point, up to BALL_PREDICT_MAX_BOUNCES bounces.
-    If the ball is stationary the list contains only the current position.
-    """
-    r    = BALL_RADIUS_MM / 1000.0
-    lo_x, hi_x = r, FIELD_WIDTH  - r
-    lo_y, hi_y = r, FIELD_HEIGHT - r
-
-    path = [[round(x, 3), round(y, 3)]]
-    if math.hypot(vx, vy) < 1e-6:
-        return path
-
-    for _ in range(BALL_PREDICT_MAX_BOUNCES):
-        # Time to each wall (inf if moving away or stationary on that axis)
-        tx = (hi_x - x) / vx if vx > 1e-9 else ((lo_x - x) / vx if vx < -1e-9 else math.inf)
-        ty = (hi_y - y) / vy if vy > 1e-9 else ((lo_y - y) / vy if vy < -1e-9 else math.inf)
-        t  = min(tx, ty)
-        if t <= 0 or not math.isfinite(t):
-            break
-
-        x += vx * t
-        y += vy * t
-
-        # Clamp to field and flip velocity
-        if tx <= ty:
-            x  = hi_x if vx > 0 else lo_x
-            vx = -vx
-        if ty <= tx:
-            y  = hi_y if vy > 0 else lo_y
-            vy = -vy
-
-        path.append([round(x, 3), round(y, 3)])
-
-    return path
+def _all_robot_positions():
+    """Return [(x, y), ...] for every known robot on the field."""
+    if _sim_state is not None:
+        robots = []
+        r = _sim_state.get("robot")
+        if r:
+            robots.append((float(r[0]), float(r[1])))
+        robots += [(float(p[0]), float(p[1])) for p in _sim_state.get("obstacles", [])]
+        return robots
+    if _robot_pos is not None:
+        return [_robot_pos]
+    return []
 
 
 def _on_broker_update(key, value):
@@ -509,7 +493,7 @@ if __name__ == "__main__":
                 result["global_pos"] = gpos
 
                 # ── Velocity tracking ────────────────────────────────────────
-                ball_vx, ball_vy, ball_pred, hidden_pos = 0.0, 0.0, None, None
+                hidden_pos = None
 
                 if gpos is not None:
                     _last_detection_t = now_t
@@ -527,38 +511,29 @@ if __name__ == "__main__":
                         _vel_last_t = -999.0
 
                 if len(_vel_history) >= BALL_VEL_HISTORY_MIN:
-                    ball_vx, ball_vy = _fit_ball_velocity(_vel_history)
-                    spd = math.hypot(ball_vx, ball_vy)
+                    vx_fit, vy_fit = _fit_ball_velocity(_vel_history)
+                    spd = math.hypot(vx_fit, vy_fit)
                     if spd > MAX_BALL_SPEED:
-                        ball_vx *= MAX_BALL_SPEED / spd
-                        ball_vy *= MAX_BALL_SPEED / spd
+                        vx_fit *= MAX_BALL_SPEED / spd
+                        vy_fit *= MAX_BALL_SPEED / spd
                     # Persist velocity so hidden-position extrapolation stays valid
-                    _last_ball_vx = ball_vx
-                    _last_ball_vy = ball_vy
+                    _last_ball_vx = vx_fit
+                    _last_ball_vy = vy_fit
 
-                # ── Predicted path (from current or extrapolated position) ────
-                origin_x, origin_y = None, None
-                if gpos is not None:
-                    origin_x, origin_y = gpos["x"], gpos["y"]
-                elif _last_ball_x is not None:
-                    # Ball is hidden — extrapolate forward from last known position
+                # ── Hidden-position extrapolation ─────────────────────────────
+                if gpos is None and _last_ball_x is not None:
                     elapsed = now_t - _last_detection_t
                     hx, hy  = _extrapolate_ball(
                         _last_ball_x, _last_ball_y,
                         _last_ball_vx, _last_ball_vy,
                         elapsed,
+                        robots=_all_robot_positions(),
                     )
                     hidden_pos = {"x": hx, "y": hy}
-                    origin_x, origin_y = hx, hy
 
-                if origin_x is not None:
-                    ball_pred = _predict_ball_path(origin_x, origin_y,
-                                                   _last_ball_vx, _last_ball_vy)
-
-                result["vx"]             = round(_last_ball_vx, 3)
-                result["vy"]             = round(_last_ball_vy, 3)
-                result["hidden_pos"]     = hidden_pos
-                result["predicted_path"] = ball_pred
+                result["vx"]         = round(_last_ball_vx, 3)
+                result["vy"]         = round(_last_ball_vy, 3)
+                result["hidden_pos"] = hidden_pos
 
                 if sim is not None:
                     result["sim_pos"] = sim.pos
