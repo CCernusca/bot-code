@@ -32,6 +32,7 @@ _walls                = []
 _position_history     = []
 _other_robots_history = []
 _ball_pos             = None  # {"x": float, "y": float} or None — detected position
+_ball_hidden_pos      = None  # {"x": float, "y": float} or None — extrapolated while hidden
 _ball_vx              = None  # m/s — fitted horizontal velocity
 _ball_vy              = None  # m/s — fitted vertical velocity
 _ball_predicted_path  = None  # [[x, y], ...] or None — predicted bounce trajectory
@@ -135,6 +136,12 @@ _art_ball_arrow = FancyArrowPatch((0, 0), (0.1, 0),
     arrowstyle='->', color='darkorange', lw=1.5, mutation_scale=10,
     zorder=9, animated=True, visible=False)
 ax.add_patch(_art_ball_arrow)
+
+# Ball hidden (extrapolated) position — dashed ghost circle shown when occluded
+_art_ball_hidden = patches.Circle((0, 0), _BALL_RADIUS,
+    lw=1.5, edgecolor='darkorange', facecolor=(1.0, 0.55, 0.0, 0.25), ls='--',
+    zorder=8, animated=True, visible=False)
+ax.add_patch(_art_ball_hidden)
 
 # Ball predicted path — dashed polyline through bounce waypoints
 (_art_ball_path,) = ax.plot([], [], color='darkorange', lw=1.0, ls='--',
@@ -255,8 +262,14 @@ def _redraw():
     if _ball_pos is not None:
         _art_ball.set_center((_ball_pos["x"], _ball_pos["y"]))
         _art_ball.set_visible(True)
+        _art_ball_hidden.set_visible(False)
+    elif _ball_hidden_pos is not None:
+        _art_ball.set_visible(False)
+        _art_ball_hidden.set_center((_ball_hidden_pos["x"], _ball_hidden_pos["y"]))
+        _art_ball_hidden.set_visible(True)
     else:
         _art_ball.set_visible(False)
+        _art_ball_hidden.set_visible(False)
 
     # ── Ball history trail ────────────────────────────────────────────────────
     if len(_ball_history) > 1:
@@ -270,9 +283,10 @@ def _redraw():
         _art_ball_hist.set_offsets(np.empty((0, 2)))
 
     # ── Ball velocity arrow ───────────────────────────────────────────────────
-    if (_ball_pos is not None and _ball_vx is not None and _ball_vy is not None
+    _arrow_origin = _ball_pos or _ball_hidden_pos
+    if (_arrow_origin is not None and _ball_vx is not None and _ball_vy is not None
             and math.hypot(_ball_vx, _ball_vy) > 0.1):
-        bx, by = _ball_pos["x"], _ball_pos["y"]
+        bx, by = _arrow_origin["x"], _arrow_origin["y"]
         _art_ball_arrow.set_positions(
             (bx, by),
             (bx + _ball_vx * 0.5, by + _ball_vy * 0.5),
@@ -353,7 +367,7 @@ def _redraw():
         _art_lidar,
         _art_self, *_art_bots, *_art_blbls,
         _art_arrow,
-        _art_ball, _art_ball_hist, _art_ball_arrow, _art_ball_path,
+        _art_ball, _art_ball_hidden, _art_ball_hist, _art_ball_arrow, _art_ball_path,
         _art_sim_ball, _art_sim_self, *_art_sim_obs,
         *_art_walls,
         _art_pos_hist, _art_bot_hist,
@@ -368,7 +382,7 @@ def on_update(key, value):
     global _lidar, _detection_origin, _detection_heading, _imu_pitch
     global _robot_pos, _other_robots, _walls
     global _position_history, _other_robots_history
-    global _ball_pos, _ball_vx, _ball_vy, _ball_predicted_path, _ball_history
+    global _ball_pos, _ball_hidden_pos, _ball_vx, _ball_vy, _ball_predicted_path, _ball_history
     global _sim_ball_pos, _sim_state
 
     if value is None:
@@ -413,11 +427,12 @@ def on_update(key, value):
 
             elif key == "ball":
                 payload           = json.loads(value)
-                _ball_pos          = payload.get("global_pos")
-                _ball_vx           = payload.get("vx")
-                _ball_vy           = payload.get("vy")
+                _ball_pos            = payload.get("global_pos")
+                _ball_hidden_pos     = payload.get("hidden_pos")
+                _ball_vx             = payload.get("vx")
+                _ball_vy             = payload.get("vy")
                 _ball_predicted_path = payload.get("predicted_path")
-                _sim_ball_pos      = payload.get("sim_pos")
+                _sim_ball_pos        = payload.get("sim_pos")
 
             elif key == "ball_history":
                 _ball_history = json.loads(value)

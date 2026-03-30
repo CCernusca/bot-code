@@ -57,6 +57,13 @@ _vel_history      = []      # [[t, x, y], ...] — recent global_pos samples
 _vel_last_t       = -999.0  # monotonic time of last history sample
 _last_detection_t = -999.0  # monotonic time of last successful detection
 
+# Last known position and velocity — kept until ball is seen again so the
+# hidden-position extrapolation can continue indefinitely after occlusion.
+_last_ball_x  = None   # metres
+_last_ball_y  = None
+_last_ball_vx = 0.0    # m/s
+_last_ball_vy = 0.0
+
 _hw_available = False
 try:
     import cv2
@@ -313,6 +320,38 @@ def _fit_ball_velocity(history):
     return float(coeffs[0, 0]), float(coeffs[0, 1])
 
 
+def _extrapolate_ball(x, y, vx, vy, dt):
+    """
+    Advance ball position analytically by dt seconds, bouncing off field walls.
+    Used to estimate the current position when the ball is temporarily hidden.
+    """
+    r    = BALL_RADIUS_MM / 1000.0
+    lo_x, hi_x = r, FIELD_WIDTH  - r
+    lo_y, hi_y = r, FIELD_HEIGHT - r
+
+    remaining = dt
+    for _ in range(10000):          # safety guard — each iteration handles one bounce
+        if remaining <= 1e-9:
+            break
+        tx = (hi_x - x) / vx if vx > 1e-9 else ((lo_x - x) / vx if vx < -1e-9 else math.inf)
+        ty = (hi_y - y) / vy if vy > 1e-9 else ((lo_y - y) / vy if vy < -1e-9 else math.inf)
+        t_wall = min(tx, ty)
+        if not math.isfinite(t_wall) or t_wall > remaining:
+            x += vx * remaining
+            y += vy * remaining
+            break
+        x += vx * t_wall
+        y += vy * t_wall
+        remaining -= t_wall
+        if tx <= ty:
+            x  = hi_x if vx > 0 else lo_x
+            vx = -vx
+        if ty <= tx:
+            y  = hi_y if vy > 0 else lo_y
+            vy = -vy
+    return round(x, 3), round(y, 3)
+
+
 def _predict_ball_path(x, y, vx, vy):
     """
     Analytical wall-bounce trajectory — no fixed time horizon.
@@ -470,17 +509,20 @@ if __name__ == "__main__":
                 result["global_pos"] = gpos
 
                 # ── Velocity tracking ────────────────────────────────────────
-                ball_vx, ball_vy, ball_pred = 0.0, 0.0, None
+                global _last_ball_x, _last_ball_y, _last_ball_vx, _last_ball_vy
+                ball_vx, ball_vy, ball_pred, hidden_pos = 0.0, 0.0, None, None
 
                 if gpos is not None:
                     _last_detection_t = now_t
+                    _last_ball_x = gpos["x"]
+                    _last_ball_y = gpos["y"]
                     if now_t - _vel_last_t >= BALL_VEL_MIN_DT:
                         _vel_history.append([now_t, gpos["x"], gpos["y"]])
                         if len(_vel_history) > BALL_VEL_HISTORY_N:
                             _vel_history.pop(0)
                         _vel_last_t = now_t
                 else:
-                    # Clear stale history after ball has been absent for 1 second
+                    # Clear stale velocity history after ball has been absent for 1 s
                     if now_t - _last_detection_t > 1.0:
                         _vel_history.clear()
                         _vel_last_t = -999.0
@@ -491,11 +533,32 @@ if __name__ == "__main__":
                     if spd > MAX_BALL_SPEED:
                         ball_vx *= MAX_BALL_SPEED / spd
                         ball_vy *= MAX_BALL_SPEED / spd
-                    if gpos is not None:
-                        ball_pred = _predict_ball_path(gpos["x"], gpos["y"], ball_vx, ball_vy)
+                    # Persist velocity so hidden-position extrapolation stays valid
+                    _last_ball_vx = ball_vx
+                    _last_ball_vy = ball_vy
 
-                result["vx"]             = round(ball_vx, 3)
-                result["vy"]             = round(ball_vy, 3)
+                # ── Predicted path (from current or extrapolated position) ────
+                origin_x, origin_y = None, None
+                if gpos is not None:
+                    origin_x, origin_y = gpos["x"], gpos["y"]
+                elif _last_ball_x is not None:
+                    # Ball is hidden — extrapolate forward from last known position
+                    elapsed = now_t - _last_detection_t
+                    hx, hy  = _extrapolate_ball(
+                        _last_ball_x, _last_ball_y,
+                        _last_ball_vx, _last_ball_vy,
+                        elapsed,
+                    )
+                    hidden_pos = {"x": hx, "y": hy}
+                    origin_x, origin_y = hx, hy
+
+                if origin_x is not None:
+                    ball_pred = _predict_ball_path(origin_x, origin_y,
+                                                   _last_ball_vx, _last_ball_vy)
+
+                result["vx"]             = round(_last_ball_vx, 3)
+                result["vy"]             = round(_last_ball_vy, 3)
+                result["hidden_pos"]     = hidden_pos
                 result["predicted_path"] = ball_pred
 
                 if sim is not None:
