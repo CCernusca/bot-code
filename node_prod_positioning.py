@@ -58,16 +58,16 @@ _tracked   = {}     # id → {"x","y","vx","vy","t","history"}
 _next_id   = 1
 
 # ── Time node state ───────────────────────────────────────────────────────────
-_time_start    = time.monotonic()
-_pos_lock      = threading.Lock()
-_pos_history   = []
-_pos_last_t    = -999.0
-_robots_lock   = threading.Lock()
+_time_start     = time.monotonic()
+_pos_lock       = threading.Lock()
+_pos_history    = []
+_pos_last_t     = -999.0
+_robots_lock    = threading.Lock()
 _robots_history = []
-_robots_last_t = -999.0
-_ball_lock     = threading.Lock()
-_ball_history  = []
-_ball_last_t   = -999.0
+_robots_last_t  = -999.0
+_ball_lock      = threading.Lock()
+_ball_history   = []
+_ball_last_t    = -999.0
 
 
 def _heading():
@@ -93,23 +93,15 @@ def _time_loop():
 
 # ── Wall detection ────────────────────────────────────────────────────────────
 
-def _lidar_to_cartesian():
-    if not _lidar:
-        return None
-    keys, vals = zip(*_lidar.items())
-    angles    = np.radians(np.array(keys, dtype=float)) + np.radians(_heading())
-    distances = np.array(vals, dtype=float) / 1000.0
-    return np.column_stack((distances * np.cos(angles), distances * np.sin(angles)))
-
-
-def _detect_walls(pts):
+def _detect_walls(rel_pts):
+    """Detect walls from robot-centred, field-aligned points (already built)."""
     walls = []
     specs = [
         (0, None, "Left",   "Right"),
         (1,    0, "Bottom", "Top"),
     ]
     for axis, gradient, label_lo, label_hi in specs:
-        vals  = pts[:, axis]
+        vals  = rel_pts[:, axis]
         v_min = float(np.min(vals))
         v_max = float(np.max(vals))
 
@@ -132,21 +124,16 @@ def _detect_walls(pts):
 
 # ── Position estimation ───────────────────────────────────────────────────────
 
-def _compute_position():
+def _compute_position(rel_pts):
+    """Estimate robot position. rel_pts is the pre-built robot-centred array."""
     if not _lidar_walls:
         return None
 
-    fa_rad = math.radians(_heading())
-
-    lidar_min_x = lidar_max_x = lidar_min_y = lidar_max_y = 0.0
-    if _lidar:
-        keys, vals = zip(*_lidar.items())
-        a_arr = np.radians(np.array(keys, dtype=float)) + fa_rad
-        d_arr = np.array(vals, dtype=float) / 1000.0
-        ox = d_arr * np.cos(a_arr)
-        oy = d_arr * np.sin(a_arr)
-        lidar_min_x, lidar_max_x = float(ox.min()), float(ox.max())
-        lidar_min_y, lidar_max_y = float(oy.min()), float(oy.max())
+    if len(rel_pts) > 0:
+        lidar_min_x, lidar_max_x = float(rel_pts[:, 0].min()), float(rel_pts[:, 0].max())
+        lidar_min_y, lidar_max_y = float(rel_pts[:, 1].min()), float(rel_pts[:, 1].max())
+    else:
+        lidar_min_x = lidar_max_x = lidar_min_y = lidar_max_y = 0.0
 
     x_candidates = []
     y_candidates = []
@@ -159,7 +146,7 @@ def _compute_position():
             for rx in (-offset, FIELD_WIDTH - offset):
                 if not (ROBOT_RADIUS - _POS_MARGIN <= rx <= FIELD_WIDTH - ROBOT_RADIUS + _POS_MARGIN):
                     continue
-                if _lidar and not (
+                if len(rel_pts) > 0 and not (
                     rx + lidar_min_x >= -_LIDAR_FIELD_TOL and
                     rx + lidar_max_x <= FIELD_WIDTH + _LIDAR_FIELD_TOL
                 ):
@@ -169,7 +156,7 @@ def _compute_position():
             for ry in (-offset, FIELD_HEIGHT - offset):
                 if not (ROBOT_RADIUS - _POS_MARGIN <= ry <= FIELD_HEIGHT - ROBOT_RADIUS + _POS_MARGIN):
                     continue
-                if _lidar and not (
+                if len(rel_pts) > 0 and not (
                     ry + lidar_min_y >= -_LIDAR_FIELD_TOL and
                     ry + lidar_max_y <= FIELD_HEIGHT + _LIDAR_FIELD_TOL
                 ):
@@ -187,20 +174,22 @@ def _compute_position():
     return round(_best(x_candidates), 3), round(_best(y_candidates), 3)
 
 
+# ── Position history (direct, no broker round-trip) ───────────────────────────
+
+def _record_pos_history(x, y, now):
+    global _pos_last_t
+    if now - _pos_last_t < POSITION_SAMPLE_S:
+        return
+    _pos_last_t = now
+    entry = {"x": x, "y": y, "t": round(_elapsed(), 3)}
+    with _pos_lock:
+        _pos_history.append(entry)
+        _prune_list(_pos_history)
+        snapshot = list(_pos_history)
+    mb.set("position_history", json.dumps(snapshot))
+
+
 # ── Robot detection & tracking ────────────────────────────────────────────────
-
-def _lidar_to_field_points():
-    if not _lidar or _robot_pos is None:
-        return None, None
-    rx, ry = _robot_pos
-    fa_rad = math.radians(_heading())
-    sorted_items = sorted(_lidar.items())
-    angles       = np.radians([a for a, _ in sorted_items]) + fa_rad
-    distances    = np.array([d for _, d in sorted_items]) / 1000.0
-    x = rx + distances * np.cos(angles)
-    y = ry + distances * np.sin(angles)
-    return np.column_stack((x, y)), np.array([rx, ry])
-
 
 def _detect_clusters(points):
     if len(points) == 0:
@@ -313,15 +302,11 @@ def _match_and_track(detections, now):
     return list(detections)
 
 
-def _detect_and_track_robots(now):
-    pts, robot_pos_arr = _lidar_to_field_points()
-    if pts is None:
-        return None, None
-
-    rx, ry = _robot_pos
-    fa_rad = math.radians(_heading())
-    clusters = _detect_clusters(pts)
-    robots = []
+def _detect_and_track_robots(field_pts, robot_pos_arr, fa_rad, now):
+    """Detect and track robots using pre-built angle-sorted field-frame pts."""
+    rx, ry   = float(robot_pos_arr[0]), float(robot_pos_arr[1])
+    clusters = _detect_clusters(field_pts)
+    robots   = []
 
     for cluster in clusters:
         if len(cluster) < MIN_CLUSTER_POINTS:
@@ -356,7 +341,7 @@ def _detect_and_track_robots(now):
 
 def on_update(key, value):
     global _imu_pitch, _lidar, _lidar_walls, _robot_pos
-    global _pos_last_t, _robots_last_t, _ball_last_t
+    global _robots_last_t, _ball_last_t
 
     if value is None:
         return
@@ -375,43 +360,39 @@ def on_update(key, value):
         except (json.JSONDecodeError, TypeError, ValueError):
             return
 
-        now = time.monotonic()
+        now    = time.monotonic()
+        fa_rad = math.radians(_heading())   # compute once for this scan
+
+        # ── Build angle-sorted point arrays ONCE for this scan ────────────────
+        sorted_items = sorted(_lidar.items())
+        angles    = np.radians(np.array([a for a, _ in sorted_items],
+                                        dtype=float)) + fa_rad
+        distances = np.array([d for _, d in sorted_items], dtype=float) / 1000.0
+        cos_a = np.cos(angles)
+        sin_a = np.sin(angles)
+        # Robot-centred, field-aligned points (shared by walls and pos)
+        rel_pts = np.column_stack((distances * cos_a, distances * sin_a))
 
         with _perf.measure("walls"):
-            pts = _lidar_to_cartesian()
-            if pts is not None:
-                _lidar_walls = _detect_walls(pts)
-                mb.set("lidar_walls", json.dumps(_lidar_walls))
+            _lidar_walls = _detect_walls(rel_pts)
+            mb.set("lidar_walls", json.dumps(_lidar_walls))
 
         with _perf.measure("pos"):
-            pos = _compute_position()
+            pos = _compute_position(rel_pts)
             if pos is not None:
                 _robot_pos = pos
                 mb.set("robot_position", json.dumps({"x": pos[0], "y": pos[1]}))
+                _record_pos_history(pos[0], pos[1], now)   # direct — no broker round-trip
 
         with _perf.measure("robots"):
-            robots, origin = _detect_and_track_robots(now)
-            if robots is not None:
-                mb.set("other_robots_detected",
-                       json.dumps({"origin": origin, "robots": robots, "t": now}))
-        return
-
-    if key == "robot_position":
-        now = time.monotonic()
-        if now - _pos_last_t < POSITION_SAMPLE_S:
-            return
-        try:
-            pos   = json.loads(value)
-            entry = {"x": float(pos["x"]), "y": float(pos["y"]),
-                     "t": round(_elapsed(), 3)}
-        except Exception:
-            return
-        _pos_last_t = now
-        with _pos_lock:
-            _pos_history.append(entry)
-            _prune_list(_pos_history)
-            snapshot = list(_pos_history)
-        mb.set("position_history", json.dumps(snapshot))
+            if _robot_pos is not None:
+                robot_pos_arr = np.array(_robot_pos)
+                field_pts     = rel_pts + robot_pos_arr    # reuse rel_pts
+                robots, origin = _detect_and_track_robots(field_pts, robot_pos_arr,
+                                                          fa_rad, now)
+                if robots is not None:
+                    mb.set("other_robots_detected",
+                           json.dumps({"origin": origin, "robots": robots, "t": now}))
         return
 
     if key == "other_robots":
@@ -464,10 +445,8 @@ if __name__ == "__main__":
 
     threading.Thread(target=_time_loop, daemon=True, name="time-publisher").start()
 
-    mb.setcallback(
-        ["lidar", "imu_pitch", "robot_position", "other_robots", "ball"],
-        on_update,
-    )
+    # robot_position is produced internally — no subscription needed
+    mb.setcallback(["lidar", "imu_pitch", "other_robots", "ball"], on_update)
     print("[POSITIONING] Starting combined positioning node...")
     try:
         mb.receiver_loop()

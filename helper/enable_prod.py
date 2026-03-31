@@ -1,76 +1,67 @@
 #!/usr/bin/env python3
 """
-Enable production nodes: kill any running individual nodes, then start all
-node_prod_* nodes as background processes.
+Enable production nodes: activate node_prod_* and deactivate dev nodes.
+
+"Activating" means removing the leading underscore from a disabled file.
+"Deactivating" means adding a leading underscore to an active file.
+
+Nodes are detected automatically from the filesystem.
+Utility nodes (node_perf.py, node_twin_vis.py) are never touched.
 """
 
 import os
-import sys
-import subprocess
-import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Individual nodes that prod nodes replace
-DEV_NODES = [
-    "node_imu.py",
-    "node_lidar.py",
-    "node_pos_walls.py",
-    "node_pos.py",
-    "node_pos_robots.py",
-    "node_predict_robots.py",
-    "node_predict_ball.py",
-    "node_vision.py",
-    "node_time.py",
-    "node_bus_display.py",
-]
-
-# Production nodes to start
-PROD_NODES = [
-    "node_prod_sensor.py",
-    "node_prod_positioning.py",
-    "node_prod_prediction.py",
-    "node_prod_vision.py",
-    "node_prod_communication.py",
-]
+UTILITY_NODES = {"node_perf.py", "node_twin_vis.py"}
 
 
-def kill_nodes(node_files):
-    for node in node_files:
-        result = subprocess.run(
-            ["pkill", "-f", f"python.*{node}"],
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            print(f"[KILL]  {node}")
-
-
-def start_nodes(node_files):
-    procs = []
-    for node in node_files:
-        path = os.path.join(ROOT, node)
-        if not os.path.exists(path):
-            print(f"[WARN]  {node} not found, skipping.")
+def classify_nodes(root):
+    """Return (prod, dev) where each is a list of current filenames."""
+    prod, dev = [], []
+    for fname in sorted(os.listdir(root)):
+        if not fname.endswith(".py"):
             continue
-        p = subprocess.Popen(
-            [sys.executable, path],
-            cwd=ROOT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print(f"[START] {node}  (pid {p.pid})")
-        procs.append(p)
-    return procs
+        base = fname.lstrip("_")
+        if base in UTILITY_NODES:
+            continue
+        if base.startswith("node_prod_"):
+            prod.append(fname)
+        elif base.startswith("node_"):
+            dev.append(fname)
+    return prod, dev
+
+
+def activate(root, fname):
+    """Remove leading underscore — make the node active."""
+    if fname.startswith("_"):
+        new = fname.lstrip("_")
+        os.rename(os.path.join(root, fname), os.path.join(root, new))
+        print(f"[ENABLE]  {fname}  →  {new}")
+    else:
+        print(f"[SKIP]    {fname}  (already active)")
+
+
+def deactivate(root, fname):
+    """Add leading underscore — make the node inactive."""
+    if not fname.startswith("_"):
+        new = "_" + fname
+        os.rename(os.path.join(root, fname), os.path.join(root, new))
+        print(f"[DISABLE] {fname}  →  {new}")
+    else:
+        print(f"[SKIP]    {fname}  (already inactive)")
 
 
 if __name__ == "__main__":
-    print("── Stopping individual nodes ─────────────────────────────────────────")
-    kill_nodes(DEV_NODES)
-    time.sleep(0.5)
+    prod_nodes, dev_nodes = classify_nodes(ROOT)
 
-    print("── Starting production nodes ─────────────────────────────────────────")
-    start_nodes(PROD_NODES)
+    print("── Activating production nodes ───────────────────────────────────────")
+    for fname in prod_nodes:
+        activate(ROOT, fname)
+
+    print("── Deactivating dev nodes ────────────────────────────────────────────")
+    for fname in dev_nodes:
+        deactivate(ROOT, fname)
 
     print("── Done ──────────────────────────────────────────────────────────────")
-    print("Production nodes are running in the background.")
     print("Run helper/disable_prod.py to switch back to individual nodes.")
