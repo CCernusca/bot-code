@@ -40,7 +40,7 @@ MAX_BALL_SPEED            = 3.0  # m/s — hard cap after fitting
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball"
 
-SIM_REPLACE = False  # Set True to force simulated ball even if a camera is found
+SIM_REPLACE = True  # Set True to force simulated ball even if a camera is found
 
 # ─────────────────────────────────────────────────────────────────────────────
 
