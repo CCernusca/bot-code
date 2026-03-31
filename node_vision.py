@@ -68,6 +68,8 @@ _last_ball_vy = 0.0
 # the direction after each bounce.
 _hidden_state   = None   # [x, y, vx, vy] or None
 _hidden_state_t = None   # None = loaded from visible but not yet advanced
+_ball_lost      = False  # latching flag — set when prediction enters FOV with no detection;
+                         # cleared only when the real ball is seen again
 
 _hw_available = False
 try:
@@ -527,6 +529,7 @@ if __name__ == "__main__":
                     _last_detection_t = now_t
                     _last_ball_x = gpos["x"]
                     _last_ball_y = gpos["y"]
+                    _ball_lost   = False   # ball re-acquired — clear the latch
 
                     # Keep hidden state in sync with the real detection.
                     # _hidden_state_t = None signals "not yet advanced" so the
@@ -570,12 +573,11 @@ if __name__ == "__main__":
                         _hidden_state[3] = vy_fit
 
                 # ── Advance hidden physics when ball is not detected ──────────
-                ball_lost = False
                 if gpos is None and _hidden_state is not None:
-                    if _in_camera_fov(_hidden_state[0], _hidden_state[1]):
+                    if _ball_lost or _in_camera_fov(_hidden_state[0], _hidden_state[1]):
                         # Prediction is inside the FOV but no ball detected —
-                        # the ball is lost.  Freeze the hidden state in place.
-                        ball_lost = True
+                        # latch the lost flag and freeze the hidden state.
+                        _ball_lost = True
                         pub_vx = pub_vy = 0.0
                     else:
                         if _hidden_state_t is None:
@@ -598,15 +600,15 @@ if __name__ == "__main__":
                     hidden_pos = {"x": round(_hidden_state[0], 3),
                                   "y": round(_hidden_state[1], 3)}
 
-                result["vx"]        = round(pub_vx, 3)
-                result["vy"]        = round(pub_vy, 3)
+                result["vx"]         = round(pub_vx, 3)
+                result["vy"]         = round(pub_vy, 3)
                 result["hidden_pos"] = hidden_pos
-                result["ball_lost"]  = ball_lost
+                result["ball_lost"]  = _ball_lost
 
                 if sim is not None:
                     result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
-                mb.set("ball_lost",  json.dumps(ball_lost))
+                mb.set("ball_lost",  json.dumps(_ball_lost))
 
             # Log to console at most once per second
             now = time.time()
