@@ -13,6 +13,7 @@ PERF_NODES = [
     "node_pos_walls",
     "node_pos",
     "node_pos_robots",
+    "node_vision",
     "node_twin_vis",
 ]
 # ─────────────────────────────────────────────────────────────────────────────
