@@ -2,7 +2,6 @@ from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
 import json
 import math
-import time
 import numpy as np
 
 # ── Field & detection configuration ──────────────────────────────────────────
@@ -23,16 +22,9 @@ MIN_CLUSTER_POINTS = 3
 # Detected diameter may differ from ROBOT_DIAMETER by at most this much.
 SIZE_TOLERANCE = 0.05   # metres
 
-# ── Confidence & tracking ─────────────────────────────────────────────────────
-MAX_ROBOTS      = 3
-
-# Two detections whose centres are closer than this are considered overlapping.
-OVERLAP_DIST    = ROBOT_RADIUS * 2   # metres
-
-VEL_MIN_DT      = 0.05   # seconds — min elapsed time between history samples
-VEL_HISTORY_N   = 10     # rolling history length per tracked robot
-VEL_HISTORY_MIN = 3      # minimum samples before fitted velocity is trusted
-MAX_ROBOT_SPEED = 2.0    # m/s — hard cap after fitting
+# ── Confidence & detection limits ─────────────────────────────────────────────
+MAX_ROBOTS   = 3
+OVERLAP_DIST = ROBOT_RADIUS * 2   # metres
 
 DEBUG = False   # set True to print per-scan detection results
 
@@ -44,10 +36,6 @@ _perf = PerfMonitor("node_pos_robots", broker=mb)
 _lidar     = {}   # {angle_deg (int): dist_mm (int)}
 _robot_pos = None # (x, y) metres, in field frame
 _imu_pitch = None # degrees — from imu_pitch broker key
-
-# ── Tracking state ────────────────────────────────────────────────────────────
-_tracked = {}   # id → {"x","y","vx","vy","t","lost","history"}
-_next_id = 1
 
 
 def _heading():
@@ -84,30 +72,6 @@ def _is_near_wall(center):
     )
 
 
-# ── Physics-aware position prediction ────────────────────────────────────────
-
-_MAX_PRED_STEPS = 20
-_MAX_PRED_DT    = 0.5   # one frame of lost → small dt; cap guards against startup/pause spikes
-
-
-def _predict_with_bounce(x, y, vx, vy, dt):
-    dt   = min(dt, _MAX_PRED_DT)
-    n    = max(1, min(int(dt / 0.02) + 1, _MAX_PRED_STEPS))
-    step = dt / n
-    for _ in range(n):
-        x += vx * step
-        y += vy * step
-        if x < ROBOT_RADIUS:
-            x = ROBOT_RADIUS;  vx = abs(vx)
-        elif x > FIELD_WIDTH - ROBOT_RADIUS:
-            x = FIELD_WIDTH - ROBOT_RADIUS;  vx = -abs(vx)
-        if y < ROBOT_RADIUS:
-            y = ROBOT_RADIUS;  vy = abs(vy)
-        elif y > FIELD_HEIGHT - ROBOT_RADIUS:
-            y = FIELD_HEIGHT - ROBOT_RADIUS;  vy = -abs(vy)
-    return x, y
-
-
 # ── Overlap filtering ─────────────────────────────────────────────────────────
 
 def _filter_overlapping(robots):
@@ -119,125 +83,12 @@ def _filter_overlapping(robots):
     return kept
 
 
-# ── Velocity fitting ──────────────────────────────────────────────────────────
-
-def _fit_velocity(history):
-    if len(history) < 2:
-        return 0.0, 0.0
-    arr = np.array(history, dtype=float)   # (N, 3): [t, x, y]
-    ts  = arr[:, 0] - arr[0, 0]
-    if ts[-1] < 1e-9:
-        return 0.0, 0.0
-    # Single LAPACK solve for both axes at once; coeffs[0] = [vx_slope, vy_slope]
-    coeffs = np.polyfit(ts, arr[:, 1:3], 1)
-    return float(coeffs[0, 0]), float(coeffs[0, 1])
-
-
-# ── ID tracking ───────────────────────────────────────────────────────────────
-
-def _match_and_track(detections, now):
-    global _tracked, _next_id
-
-    predictions = {}
-    for tid, tr in _tracked.items():
-        dt = now - tr["t"]
-        predictions[tid] = _predict_with_bounce(
-            tr["x"], tr["y"], tr["vx"], tr["vy"], dt,
-        )
-
-    matched_det   = [None] * len(detections)
-    matched_track = set()
-
-    if detections and predictions:
-        pred_ids = list(predictions.keys())
-        det_xy   = np.array([[d["x"], d["y"]] for d in detections])  # (D, 2)
-        pred_xy  = np.array([predictions[tid] for tid in pred_ids])  # (T, 2)
-        dist_mat = np.hypot(det_xy[:, 0:1] - pred_xy[:, 0],
-                            det_xy[:, 1:2] - pred_xy[:, 1])          # (D, T)
-        pairs = sorted(
-            (dist_mat[di, ti], di, pred_ids[ti])
-            for di in range(len(detections))
-            for ti in range(len(pred_ids))
-        )
-        for _, di, tid in pairs:
-            if matched_det[di] is None and tid not in matched_track:
-                matched_det[di] = tid
-                matched_track.add(tid)
-
-    new_tracked = {}
-
-    for di, det in enumerate(detections):
-        tid = matched_det[di]
-
-        if tid is not None:
-            old     = _tracked[tid]
-            dt      = now - old["t"]
-            history = old.get("history", [])
-
-            if dt >= VEL_MIN_DT:
-                history = history + [(now, det["x"], det["y"])]
-                history = history[-VEL_HISTORY_N:]
-
-            if len(history) >= VEL_HISTORY_MIN:
-                new_vx, new_vy = _fit_velocity(history)
-            else:
-                new_vx, new_vy = old["vx"], old["vy"]
-
-            spd = math.hypot(new_vx, new_vy)
-            if spd > MAX_ROBOT_SPEED:
-                new_vx *= MAX_ROBOT_SPEED / spd
-                new_vy *= MAX_ROBOT_SPEED / spd
-
-            new_tracked[tid] = {
-                "x": det["x"], "y": det["y"], "t": now,
-                "vx": new_vx, "vy": new_vy,
-                "lost": 0, "history": history,
-            }
-        else:
-            if len(new_tracked) >= MAX_ROBOTS:
-                continue   # at capacity — discard this detection
-            tid = _next_id
-            _next_id += 1
-            new_tracked[tid] = {
-                "x": det["x"], "y": det["y"], "t": now,
-                "vx": 0.0, "vy": 0.0,
-                "lost": 0, "history": [(now, det["x"], det["y"])],
-            }
-
-        det["id"]  = tid
-        det["vx"]  = round(new_tracked[tid]["vx"], 3)
-        det["vy"]  = round(new_tracked[tid]["vy"], 3)
-
-    result = list(detections)
-
-    for tid, tr in _tracked.items():
-        if tid in matched_track:
-            continue
-        dt = now - tr["t"]
-        px, py = _predict_with_bounce(tr["x"], tr["y"], tr["vx"], tr["vy"], dt)
-        # Advance the stored state so next frame's dt is always one step,
-        # not growing from the original detection timestamp.
-        new_tracked[tid] = {**tr, "x": px, "y": py, "t": now, "lost": tr["lost"] + 1}
-        result.append({
-            "x": round(px, 3), "y": round(py, 3),
-            "pts": 0, "method": "predicted",
-            "confidence": 0.0,
-            "id": tid,
-            "vx": round(tr["vx"], 3),
-            "vy": round(tr["vy"], 3),
-        })
-
-    _tracked = new_tracked
-    return result
-
-
 # ── Main detection ────────────────────────────────────────────────────────────
 
 def _detect_robots():
     if not _lidar or _robot_pos is None:
         return [], None
 
-    now    = time.monotonic()
     rx, ry = _robot_pos
     fa_rad = math.radians(_heading())
 
@@ -282,14 +133,11 @@ def _detect_robots():
 
     robots.sort(key=lambda r: r["confidence"], reverse=True)
     robots = _filter_overlapping(robots)[:MAX_ROBOTS]
-    robots = _match_and_track(robots, now)
 
     if DEBUG:
         for r in robots:
-            print(f"  [ROBOTS] id={r['id']}  {r['pts']:2d} pts"
-                  f"  ({r['x']:.3f}, {r['y']:.3f})"
-                  f"  conf={r['confidence']:.2f}  [{r['method']}]"
-                  f"  v=({r['vx']:.2f}, {r['vy']:.2f})")
+            print(f"  [ROBOTS] {r['pts']:2d} pts  ({r['x']:.3f}, {r['y']:.3f})"
+                  f"  conf={r['confidence']:.2f}")
 
     origin = {"x": round(rx, 4), "y": round(ry, 4), "heading": round(math.degrees(fa_rad), 3)}
     return robots, origin
@@ -326,7 +174,7 @@ def on_update(key, value):
     if key == "lidar":
         with _perf.measure("lidar"):
             robots, origin = _detect_robots()
-            mb.set("other_robots", json.dumps({"origin": origin, "robots": robots}))
+            mb.set("other_robots_raw", json.dumps({"origin": origin, "robots": robots}))
 
 
 if __name__ == "__main__":

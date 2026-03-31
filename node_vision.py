@@ -27,18 +27,12 @@ BALL_RADIUS_MM = 21.0  # Real-world ball radius in mm (used for distance calc)
 # ── Robot geometry ────────────────────────────────────────────────────────────
 ROBOT_RADIUS = 0.09   # metres — camera sits one radius ahead of the robot centre
 
-# ── Field dimensions (for velocity prediction bounce) ─────────────────────────
+# ── Field dimensions (used by SimBall physics) ────────────────────────────────
 FIELD_WIDTH  = 1.82
 FIELD_HEIGHT = 2.43
 
-# ── Ball velocity tracking ────────────────────────────────────────────────────
-BALL_VEL_HISTORY_N   = 10    # rolling history length
-BALL_VEL_HISTORY_MIN = 3     # minimum samples before velocity is trusted
-BALL_VEL_MIN_DT      = 0.05  # seconds — min elapsed time between history samples
-MAX_BALL_SPEED            = 3.0  # m/s — hard cap after fitting
-
 # ── Broker key ────────────────────────────────────────────────────────────────
-BROKER_KEY = "ball"
+BROKER_KEY = "ball_raw"
 
 SIM_REPLACE = True  # Set True to force simulated ball even if a camera is found
 
@@ -51,25 +45,6 @@ _robot_pos = None   # (x, y) metres — from robot_position broker key
 _imu_pitch = None   # degrees       — from imu_pitch broker key
 _sim_state = None   # {"robot": [x,y], "obstacles": [[x,y],...]} — from sim_state broker key
 
-# ── Ball velocity state (main-loop only, no lock needed) ──────────────────────
-_vel_history      = []      # [[t, x, y], ...] — recent global_pos samples
-_vel_last_t       = -999.0  # monotonic time of last history sample
-_last_detection_t = -999.0  # monotonic time of last successful detection
-
-# Last known position and velocity — kept until ball is seen again so the
-# hidden-position extrapolation can continue indefinitely after occlusion.
-_last_ball_x  = None   # metres
-_last_ball_y  = None
-_last_ball_vx = 0.0    # m/s
-_last_ball_vy = 0.0
-
-# Incremental hidden-physics state — advanced one frame at a time so that
-# (a) robot positions used are always current and (b) velocity reflects
-# the direction after each bounce.
-_hidden_state   = None   # [x, y, vx, vy] or None
-_hidden_state_t = None   # None = loaded from visible but not yet advanced
-_ball_lost      = False  # latching flag — set when prediction enters FOV with no detection;
-                         # cleared only when the real ball is seen again
 
 _hw_available = False
 try:
@@ -312,98 +287,6 @@ class _SimBall:
         return {"x": round(self._x, 3), "y": round(self._y, 3)}
 
 
-def _fit_ball_velocity(history):
-    """
-    Linear velocity fit over [[t, x, y], ...] history.
-    Returns (vx, vy) in m/s, or (0.0, 0.0) if insufficient data.
-    """
-    if len(history) < BALL_VEL_HISTORY_MIN:
-        return 0.0, 0.0
-    arr = np.array(history, dtype=float)
-    ts  = arr[:, 0] - arr[0, 0]
-    if ts[-1] < 1e-9:
-        return 0.0, 0.0
-    coeffs = np.polyfit(ts, arr[:, 1:3], 1)
-    return float(coeffs[0, 0]), float(coeffs[0, 1])
-
-
-def _extrapolate_ball(x, y, vx, vy, dt, robots=None):
-    """
-    Step-based physics simulation advancing the ball by dt seconds.
-
-    Handles elastic bounces off field walls and circular robot bodies
-    (same mechanics as _SimBall).  Used to estimate the current ball
-    position when it is temporarily hidden from the camera.
-
-    robots: list of (rx, ry) robot centres in metres, or None.
-    """
-    STEP = 0.02                        # 20 ms per step
-    r    = BALL_RADIUS_MM / 1000.0
-    sep  = ROBOT_RADIUS + r            # ball-centre to robot-centre at contact
-
-    n    = max(1, round(dt / STEP))
-    step = dt / n
-
-    for _ in range(n):
-        x += vx * step
-        y += vy * step
-
-        # ── Wall bounces ──────────────────────────────────────────────────────
-        if   x < r:                x = r;                vx =  abs(vx)
-        elif x > FIELD_WIDTH  - r: x = FIELD_WIDTH  - r; vx = -abs(vx)
-        if   y < r:                y = r;                vy =  abs(vy)
-        elif y > FIELD_HEIGHT - r: y = FIELD_HEIGHT - r; vy = -abs(vy)
-
-        # ── Elastic bounces off robot bodies ──────────────────────────────────
-        if robots:
-            for rx, ry in robots:
-                dx, dy = x - rx, y - ry
-                dist   = math.hypot(dx, dy)
-                if 0 < dist < sep:
-                    nx, ny = dx / dist, dy / dist
-                    x, y   = rx + nx * sep, ry + ny * sep
-                    dot    = vx * nx + vy * ny
-                    if dot < 0:
-                        vx -= 2 * dot * nx
-                        vy -= 2 * dot * ny
-
-    return x, y, vx, vy
-
-
-def _all_robot_positions():
-    """Return [(x, y), ...] for every known robot on the field."""
-    if _sim_state is not None:
-        robots = []
-        r = _sim_state.get("robot")
-        if r:
-            robots.append((float(r[0]), float(r[1])))
-        robots += [(float(p[0]), float(p[1])) for p in _sim_state.get("obstacles", [])]
-        return robots
-    if _robot_pos is not None:
-        return [_robot_pos]
-    return []
-
-
-def _in_camera_fov(bx, by):
-    """
-    Return True if the global position (bx, by) falls within the camera's
-    current horizontal FOV.  Returns False if robot position/heading unknown.
-    """
-    if _robot_pos is None or _imu_pitch is None:
-        return False
-    heading_rad = math.radians(_imu_pitch)
-    cam_x = _robot_pos[0] + ROBOT_RADIUS * math.cos(heading_rad)
-    cam_y = _robot_pos[1] + ROBOT_RADIUS * math.sin(heading_rad)
-    dx, dy  = bx - cam_x, by - cam_y
-    cos_h   = math.cos(heading_rad)
-    sin_h   = math.sin(heading_rad)
-    local_z =  dx * cos_h + dy * sin_h   # depth  (forward)
-    local_x = -dx * sin_h + dy * cos_h   # lateral
-    if local_z <= 0:
-        return False
-    angle = math.degrees(math.atan2(abs(local_x), local_z))
-    return angle <= FOV_DEG / 2.0
-
 
 def _on_broker_update(key, value):
     global _robot_pos, _imu_pitch, _sim_state
@@ -512,7 +395,6 @@ if __name__ == "__main__":
                     break
 
             with _perf.measure("frame"):
-                now_t  = time.monotonic()
                 result = _process_frame(frame)
 
                 gpos = None
@@ -521,94 +403,9 @@ if __name__ == "__main__":
 
                 result["global_pos"] = gpos
 
-                # ── Velocity tracking + hidden-position extrapolation ─────────
-                hidden_pos = None
-                pub_vx, pub_vy = _last_ball_vx, _last_ball_vy
-
-                if gpos is not None:
-                    _last_detection_t = now_t
-                    _last_ball_x = gpos["x"]
-                    _last_ball_y = gpos["y"]
-                    _ball_lost   = False   # ball re-acquired — clear the latch
-
-                    # Keep hidden state in sync with the real detection.
-                    # _hidden_state_t = None signals "not yet advanced" so the
-                    # ghost circle appears exactly at the last seen position.
-                    _hidden_state   = [gpos["x"], gpos["y"],
-                                       _last_ball_vx, _last_ball_vy]
-                    _hidden_state_t = None
-
-                    # Validate sample before adding: reject if movement implies
-                    # speed above MAX_BALL_SPEED × 1.5 (outlier / noise spike).
-                    if now_t - _vel_last_t >= BALL_VEL_MIN_DT:
-                        ok = True
-                        if _vel_history:
-                            dt_s = now_t - _vel_history[-1][0]
-                            if math.hypot(gpos["x"] - _vel_history[-1][1],
-                                          gpos["y"] - _vel_history[-1][2]
-                                          ) > MAX_BALL_SPEED * dt_s * 1.5:
-                                ok = False
-                        if ok:
-                            _vel_history.append([now_t, gpos["x"], gpos["y"]])
-                            if len(_vel_history) > BALL_VEL_HISTORY_N:
-                                _vel_history.pop(0)
-                        _vel_last_t = now_t
-                else:
-                    # Clear stale velocity history after ball has been absent for 1 s
-                    if now_t - _last_detection_t > 1.0:
-                        _vel_history.clear()
-                        _vel_last_t = -999.0
-
-                if len(_vel_history) >= BALL_VEL_HISTORY_MIN:
-                    vx_fit, vy_fit = _fit_ball_velocity(_vel_history)
-                    spd = math.hypot(vx_fit, vy_fit)
-                    if spd > MAX_BALL_SPEED:
-                        vx_fit *= MAX_BALL_SPEED / spd
-                        vy_fit *= MAX_BALL_SPEED / spd
-                    _last_ball_vx = vx_fit
-                    _last_ball_vy = vy_fit
-                    # Propagate updated velocity into hidden state while visible
-                    if _hidden_state is not None:
-                        _hidden_state[2] = vx_fit
-                        _hidden_state[3] = vy_fit
-
-                # ── Advance hidden physics when ball is not detected ──────────
-                if gpos is None and _hidden_state is not None:
-                    if _ball_lost or _in_camera_fov(_hidden_state[0], _hidden_state[1]):
-                        # Prediction is inside the FOV but no ball detected —
-                        # latch the lost flag and freeze the hidden state.
-                        _ball_lost = True
-                        pub_vx = pub_vy = 0.0
-                    else:
-                        if _hidden_state_t is None:
-                            # First hidden frame: publish at exact last-seen
-                            # position, no advancement yet.
-                            _hidden_state_t = now_t
-                        else:
-                            dt_frame = now_t - _hidden_state_t
-                            if dt_frame > 0:
-                                hx, hy, hvx, hvy = _extrapolate_ball(
-                                    _hidden_state[0], _hidden_state[1],
-                                    _hidden_state[2], _hidden_state[3],
-                                    dt_frame,
-                                    robots=_all_robot_positions(),
-                                )
-                                _hidden_state   = [hx, hy, hvx, hvy]
-                                _hidden_state_t = now_t
-                        pub_vx = _hidden_state[2]
-                        pub_vy = _hidden_state[3]
-                    hidden_pos = {"x": round(_hidden_state[0], 3),
-                                  "y": round(_hidden_state[1], 3)}
-
-                result["vx"]         = round(pub_vx, 3)
-                result["vy"]         = round(pub_vy, 3)
-                result["hidden_pos"] = hidden_pos
-                result["ball_lost"]  = _ball_lost
-
                 if sim is not None:
                     result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
-                mb.set("ball_lost",  json.dumps(_ball_lost))
 
             # Log to console at most once per second
             now = time.time()
