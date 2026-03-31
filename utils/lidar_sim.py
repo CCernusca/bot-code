@@ -163,7 +163,7 @@ def _physics_loop(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
 
 # ── Public interface ──────────────────────────────────────────────────────────
 
-def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None,
+def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on_state=None,
                     width=1.82, length=2.43, step_size=1, proximity=0.1, robot_radius=0.09):
     """
     Simulates RPLidar C1 with independent physics and lidar threads.
@@ -221,6 +221,9 @@ def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None,
                 rx, ry           = rob_pos[0], rob_pos[1]
                 _physics_heading = math.degrees(rob_heading[0])
                 obs_snap         = obs_pos.copy()
+
+            if on_state is not None:
+                on_state(rx, ry, obs_snap)
 
             # Use externally-supplied heading if provided (e.g. from imu_pitch),
             # otherwise fall back to the internal physics heading.

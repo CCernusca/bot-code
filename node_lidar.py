@@ -77,10 +77,19 @@ if __name__ == "__main__":
     else:
         if SIM_REPLACE:
             print("Falling back to simulated sensor data.")
+
+            def on_sim_state(rx, ry, obs_snap):
+                mb.set("sim_state", json.dumps({
+                    "robot":     [round(rx, 4), round(ry, 4)],
+                    "obstacles": [[round(float(p[0]), 4), round(float(p[1]), 4)]
+                                  for p in obs_snap],
+                }))
+
             lidar_sim.read_lidar_data(
                 on_measurement,
                 get_heading=lambda: _imu_pitch if _imu_pitch is not None else 0.0,
                 on_scan=on_scan,
+                on_state=on_sim_state,
                 # Per-ray fallback (realistic drip-feed, matches real hardware):
                 # on_scan=None,
             )
