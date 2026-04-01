@@ -14,7 +14,7 @@ from utils.cooperation_reader import SerialCooperationReader, SimCooperationRead
 COOP_SIM_REPLACE = True
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_cooperation", broker=mb, print_every=100)
+_perf = PerfMonitor("node_prod_communication", broker=mb, print_every=100)
 
 
 def _make_reader():

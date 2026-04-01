@@ -9,7 +9,7 @@ SIM_REPLACE = True  # Use simulation if sensor is not found
 BATCH_SIZE  = 360   # Publish to broker every N measurements
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_lidar", broker=mb, print_every=50)
+_perf = PerfMonitor("node_dev_lidar", broker=mb, print_every=50)
 
 angle_dict   = {}
 _batch_count = 0

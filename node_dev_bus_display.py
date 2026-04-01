@@ -6,7 +6,7 @@ import os
 DISPLAY_LIMIT = 10   # Max collection entries shown per value
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_bus_display", broker=mb)
+_perf = PerfMonitor("node_dev_bus_display", broker=mb)
 
 CURSOR_UP_LEFT = "\033[H"  # Jump to top-left (home)
 HIDE_CURSOR    = "\033[?25l"

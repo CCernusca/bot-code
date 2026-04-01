@@ -87,7 +87,7 @@ class _SimPitch:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 broker = TelemetryBroker()
-_perf  = PerfMonitor("node_imu", broker=broker, print_every=1000)
+_perf  = PerfMonitor("node_dev_imu", broker=broker, print_every=1000)
 
 if _hw_available:
     _check_baudrate()

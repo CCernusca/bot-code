@@ -13,7 +13,7 @@ DEBUG = False   # set True to print per-scan wall detection results
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_pos_walls", broker=mb)
+_perf = PerfMonitor("node_dev_dev_pos_walls", broker=mb)
 
 _lidar     = {}    # angle_deg (int) → dist_mm (int)
 _imu_pitch = None  # degrees — from imu_pitch broker key; None = not yet received

@@ -19,7 +19,7 @@ _MAX_WALLS      = 4   # pre-allocated wall line slots per detection source
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_twin_vis", broker=mb, print_every=50)
+_perf = PerfMonitor("node_dev_twin_vis", broker=mb, print_every=50)
 
 # ── Broker state ──────────────────────────────────────────────────────────────
 _lidar             = {}

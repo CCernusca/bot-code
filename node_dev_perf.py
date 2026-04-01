@@ -13,19 +13,19 @@ PERF_NODES = [
     "node_prod_positioning",
     "node_prod_prediction",
     "node_prod_vision",
-    "node_cooperation",
+    "node_prod_communication",
     # ── Individual (dev) nodes ────────────────────────────────────────────────
-    "node_imu",
-    "node_lidar",
-    "node_pos_walls",
-    "node_pos",
-    "node_pos_robots",
-    "node_predict_robots",
-    "node_predict_ball",
-    "node_vision",
-    "node_twin_vis",
-    "node_time",
-    "node_bus_display",
+    "node_dev_imu",
+    "node_dev_lidar",
+    "node_dev_pos_walls",
+    "node_dev_pos",
+    "node_dev_pos_robots",
+    "node_dev_predict_robots",
+    "node_dev_predict_ball",
+    "node_dev_vision",
+    "node_dev_twin_vis",
+    "node_dev_time",
+    "node_dev_bus_display",
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ def _render() -> str:
         for node in PERF_NODES:
             keys = _state.get(node)
             if not keys:
-                rows += f"{_DIM}{node:<{_COL_NODE}}{'no data':<{_COL_KEY}}{_RESET}\n"
+                rows += f"{_DIM}{node:<{_COL_NODE}}{'no data                                                  ':<{_COL_KEY}}{_RESET}\n"
                 continue
             for i, (key, stats) in enumerate(sorted(keys.items())):
                 node_label = node if i == 0 else ""

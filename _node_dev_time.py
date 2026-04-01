@@ -12,7 +12,7 @@ BALL_SAMPLE_S      = 0.1  # minimum interval between saved ball position samples
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb              = TelemetryBroker()
-_perf           = PerfMonitor("node_time", broker=mb)
+_perf           = PerfMonitor("node_dev_time", broker=mb)
 _start          = time.monotonic()
 _pos_lock       = threading.Lock()
 _pos_history    = []    # [{"x": float, "y": float, "t": float}, ...]

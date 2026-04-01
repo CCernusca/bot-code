@@ -37,7 +37,7 @@ DEBUG = False   # set True to print per-scan detection results
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_pos_robots", broker=mb)
+_perf = PerfMonitor("node_dev_pos_robots", broker=mb)
 
 _lidar     = {}   # {angle_deg (int): dist_mm (int)}
 _robot_pos = None # (x, y) metres, in field frame
