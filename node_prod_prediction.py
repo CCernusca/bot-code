@@ -1,5 +1,6 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
+from collections import deque
 import json
 import math
 import time
@@ -36,7 +37,8 @@ _sim_state = None
 _robot_last = {}   # id → {"x", "y", "vx", "vy", "t"}
 
 # ── Ball prediction state ─────────────────────────────────────────────────────
-_vel_history      = []
+_vel_history      = deque(maxlen=BALL_VEL_HISTORY_N)
+_vel_history_dirty = False   # True when a new sample was appended since last fit
 _vel_last_t       = -999.0
 _last_detection_t = -999.0
 _last_ball_vx     = 0.0
@@ -66,25 +68,41 @@ def _predict_with_bounce(x, y, vx, vy, dt):
 def _fit_ball_velocity(history):
     if len(history) < BALL_VEL_HISTORY_MIN:
         return 0.0, 0.0
-    arr = np.array(history, dtype=float)
+    arr = np.array(history, dtype=float)  # (N, 3): t, x, y
     ts  = arr[:, 0] - arr[0, 0]
     if ts[-1] < 1e-9:
         return 0.0, 0.0
-    coeffs = np.polyfit(ts, arr[:, 1:3], 1)
-    return float(coeffs[0, 0]), float(coeffs[0, 1])
+    # Closed-form linear regression — avoids np.polyfit's SVD overhead
+    n     = len(ts)
+    St    = ts.sum()
+    Stt   = (ts * ts).sum()
+    denom = n * Stt - St * St
+    if abs(denom) < 1e-9:
+        return 0.0, 0.0
+    xy   = arr[:, 1:3]
+    Sxy  = (ts[:, None] * xy).sum(axis=0)
+    Sval = xy.sum(axis=0)
+    vx, vy = (n * Sxy - St * Sval) / denom
+    return float(vx), float(vy)
 
 
-def _all_robot_positions():
+# Robot positions cached and only rebuilt when context keys change
+_robot_positions_cache: list = []
+
+
+def _rebuild_robot_positions_cache():
+    global _robot_positions_cache
     if _sim_state is not None:
         robots = []
         r = _sim_state.get("robot")
         if r:
             robots.append((float(r[0]), float(r[1])))
         robots += [(float(p[0]), float(p[1])) for p in _sim_state.get("obstacles", [])]
-        return robots
-    if _robot_pos is not None:
-        return [_robot_pos]
-    return []
+        _robot_positions_cache = robots
+    elif _robot_pos is not None:
+        _robot_positions_cache = [_robot_pos]
+    else:
+        _robot_positions_cache = []
 
 
 def _in_camera_fov(bx, by):
@@ -132,7 +150,7 @@ def _extrapolate_ball(x, y, vx, vy, dt, robots=None):
 def on_update(key, value):
     global _robot_pos, _imu_pitch, _sim_state
     global _robot_last
-    global _vel_history, _vel_last_t, _last_detection_t
+    global _vel_history, _vel_history_dirty, _vel_last_t, _last_detection_t
     global _last_ball_vx, _last_ball_vy
     global _hidden_state, _hidden_state_t, _ball_lost
 
@@ -143,6 +161,7 @@ def on_update(key, value):
         try:
             p = json.loads(value)
             _robot_pos = (float(p["x"]), float(p["y"]))
+            _rebuild_robot_positions_cache()
         except Exception:
             pass
         return
@@ -157,6 +176,7 @@ def on_update(key, value):
     if key == "sim_state":
         try:
             _sim_state = json.loads(value)
+            _rebuild_robot_positions_cache()
         except Exception:
             pass
         return
@@ -229,16 +249,17 @@ def on_update(key, value):
                                       ) > MAX_BALL_SPEED * dt_s * 1.5:
                             ok = False
                     if ok:
-                        _vel_history.append([now_t, gpos["x"], gpos["y"]])
-                        if len(_vel_history) > BALL_VEL_HISTORY_N:
-                            _vel_history.pop(0)
+                        _vel_history.append((now_t, gpos["x"], gpos["y"]))  # deque: O(1), auto-truncates
+                        _vel_history_dirty = True
                     _vel_last_t = now_t
             else:
                 if now_t - _last_detection_t > 1.0:
                     _vel_history.clear()
+                    _vel_history_dirty = False
                     _vel_last_t = -999.0
 
-            if len(_vel_history) >= BALL_VEL_HISTORY_MIN:
+            # Only refit when a new sample was actually added
+            if _vel_history_dirty and len(_vel_history) >= BALL_VEL_HISTORY_MIN:
                 vx_fit, vy_fit = _fit_ball_velocity(_vel_history)
                 spd = math.hypot(vx_fit, vy_fit)
                 if spd > MAX_BALL_SPEED:
@@ -249,6 +270,7 @@ def on_update(key, value):
                 if _hidden_state is not None:
                     _hidden_state[2] = vx_fit
                     _hidden_state[3] = vy_fit
+                _vel_history_dirty = False
 
             if gpos is None and _hidden_state is not None:
                 if _ball_lost or _in_camera_fov(_hidden_state[0], _hidden_state[1]):
@@ -263,7 +285,7 @@ def on_update(key, value):
                             hx, hy, hvx, hvy = _extrapolate_ball(
                                 _hidden_state[0], _hidden_state[1],
                                 _hidden_state[2], _hidden_state[3],
-                                dt_frame, robots=_all_robot_positions(),
+                                dt_frame, robots=_robot_positions_cache,
                             )
                             _hidden_state   = [hx, hy, hvx, hvy]
                             _hidden_state_t = now_t
@@ -284,8 +306,7 @@ def on_update(key, value):
 
 if __name__ == "__main__":
     for key, target, parse in [
-        ("robot_position", "_robot_pos", lambda v: (float(json.loads(v)["x"]),
-                                                     float(json.loads(v)["y"]))),
+        ("robot_position", "_robot_pos", lambda v: (lambda p: (float(p["x"]), float(p["y"])))(json.loads(v))),
         ("imu_pitch",      "_imu_pitch", float),
         ("sim_state",      "_sim_state", json.loads),
     ]:
@@ -296,6 +317,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+    _rebuild_robot_positions_cache()
     print("[PREDICTION] Starting combined prediction node...")
     mb.setcallback(
         ["ball_raw", "other_robots_detected", "robot_position", "imu_pitch", "sim_state"],

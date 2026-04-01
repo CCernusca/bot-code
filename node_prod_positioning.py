@@ -1,5 +1,6 @@
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
+from collections import deque
 import json
 import math
 import time
@@ -232,12 +233,22 @@ def _predict_pos(x, y, vx, vy, dt):
 def _fit_velocity(history):
     if len(history) < 2:
         return 0.0, 0.0
-    arr = np.array(history, dtype=float)
+    arr = np.array(history, dtype=float)  # (N, 3): t, x, y
     ts  = arr[:, 0] - arr[0, 0]
     if ts[-1] < 1e-9:
         return 0.0, 0.0
-    coeffs = np.polyfit(ts, arr[:, 1:3], 1)
-    return float(coeffs[0, 0]), float(coeffs[0, 1])
+    # Closed-form linear regression — avoids np.polyfit's SVD overhead
+    n     = len(ts)
+    St    = ts.sum()
+    Stt   = (ts * ts).sum()
+    denom = n * Stt - St * St
+    if abs(denom) < 1e-9:
+        return 0.0, 0.0
+    xy   = arr[:, 1:3]                         # (N, 2)
+    Sxy  = (ts[:, None] * xy).sum(axis=0)      # (2,)
+    Sval = xy.sum(axis=0)                       # (2,)
+    vx, vy = (n * Sxy - St * Sval) / denom
+    return float(vx), float(vy)
 
 
 def _match_and_track(detections, now):
@@ -272,9 +283,9 @@ def _match_and_track(detections, now):
         tid = matched_det[di]
         if tid is not None:
             old     = _tracked[tid]
-            history = old.get("history", [])
+            history = deque(old.get("history", []), maxlen=VEL_HISTORY_N)
             if now - old["t"] >= VEL_MIN_DT:
-                history = (history + [(now, det["x"], det["y"])])[-VEL_HISTORY_N:]
+                history.append((now, det["x"], det["y"]))   # O(1), auto-truncates
             new_vx, new_vy = _fit_velocity(history) if len(history) >= VEL_HISTORY_MIN \
                              else (old["vx"], old["vy"])
             spd = math.hypot(new_vx, new_vy)
@@ -289,7 +300,8 @@ def _match_and_track(detections, now):
             tid = _next_id;  _next_id += 1
             new_tracked[tid] = {"x": det["x"], "y": det["y"], "t": now,
                                  "vx": 0.0, "vy": 0.0,
-                                 "history": [(now, det["x"], det["y"])]}
+                                 "history": deque([(now, det["x"], det["y"])],
+                                                  maxlen=VEL_HISTORY_N)}
         det["id"]  = tid
         det["vx"]  = round(new_tracked[tid]["vx"], 3)
         det["vy"]  = round(new_tracked[tid]["vy"], 3)
@@ -302,26 +314,33 @@ def _match_and_track(detections, now):
     return list(detections)
 
 
-def _detect_and_track_robots(field_pts, robot_pos_arr, fa_rad, now):
-    """Detect and track robots using pre-built angle-sorted field-frame pts."""
+def _detect_and_track_robots(rel_pts, robot_pos_arr, fa_rad, now):
+    """Detect and track robots.
+
+    Runs cluster detection on robot-centred rel_pts (no field-frame copy
+    needed — consecutive distances are translation-invariant).  Only the final
+    cluster centres are offset to field coordinates.
+    """
     rx, ry   = float(robot_pos_arr[0]), float(robot_pos_arr[1])
-    clusters = _detect_clusters(field_pts)
+    clusters = _detect_clusters(rel_pts)
     robots   = []
 
     for cluster in clusters:
         if len(cluster) < MIN_CLUSTER_POINTS:
             continue
-        center    = np.mean(cluster, axis=0)
-        direction = center - robot_pos_arr
-        d = np.hypot(direction[0], direction[1])
+        # Work entirely in relative frame; robot is at the origin
+        rel_center = np.mean(cluster, axis=0)
+        d = float(np.hypot(rel_center[0], rel_center[1]))
         if d > 1e-9:
-            center = center + (direction / d) * ROBOT_RADIUS
-        if _is_near_wall(center[0], center[1]):
+            rel_center = rel_center + (rel_center / d) * ROBOT_RADIUS
+        # Convert centre to field frame for wall check and output
+        cx, cy = rx + float(rel_center[0]), ry + float(rel_center[1])
+        if _is_near_wall(cx, cy):
             continue
-        dists = np.linalg.norm(cluster - center, axis=1)
+        # Distance std — translation-invariant, stays in relative frame
+        dists = np.linalg.norm(cluster - rel_center, axis=1)
         if np.std(dists) > 0.03:
             continue
-        cx, cy = float(center[0]), float(center[1])
         robots.append({
             "x": round(cx, 3), "y": round(cy, 3),
             "pts": len(cluster), "method": "cluster",
@@ -386,9 +405,8 @@ def on_update(key, value):
 
         with _perf.measure("robots"):
             if _robot_pos is not None:
-                robot_pos_arr = np.array(_robot_pos)
-                field_pts     = rel_pts + robot_pos_arr    # reuse rel_pts
-                robots, origin = _detect_and_track_robots(field_pts, robot_pos_arr,
+                robot_pos_arr  = np.array(_robot_pos)
+                robots, origin = _detect_and_track_robots(rel_pts, robot_pos_arr,
                                                           fa_rad, now)
                 if robots is not None:
                     mb.set("other_robots_detected",
