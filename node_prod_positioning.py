@@ -59,9 +59,10 @@ _lidar_walls = []   # [{"gradient": 0|None, "offset": float}, ...]
 _robot_pos   = None   # (x, y) metres — updated after each position computation
 _tracked     = {}     # id → {"x","y","vx","vy","t","history"}
 _next_id     = 1
-_ally_data   = None   # latest ally_data payload from communication node
-_ally_data_t = 0.0    # monotonic time of last ally_data update
-_ally_id     = None   # persistent ally robot ID
+_ally_data    = None   # latest ally_data payload from communication node
+_ally_data_t  = 0.0    # monotonic time of last ally_data update
+_ally_id      = None   # persistent ally robot ID
+_sys_ball_pos = None   # latest raw ball position from vision node
 
 # ── Time node state ───────────────────────────────────────────────────────────
 _time_start     = time.monotonic()
@@ -434,90 +435,111 @@ def _apply_ally_updates(robots, now):
             "vy":  round(tr.get("vy", 0.0), 3),
         })
 
-    matched = set()   # robot IDs already updated this call
+    with _perf.measure("ally_match"):
+        matched = set()   # robot IDs already updated this call
 
-    # ── 1. Ally main position ─────────────────────────────────────────────────
-    main_d    = _ally_data.get("main_pos")
-    main_pos  = _apos(main_d)
-    main_conf = _aconf(main_d)
+        # ── 1. Ally main position ─────────────────────────────────────────────
+        main_d    = _ally_data.get("main_pos")
+        main_pos  = _apos(main_d)
+        main_conf = _aconf(main_d)
 
-    if main_pos is not None:
-        match = None
-        if _ally_id is not None:
-            match = next((r for r in robots if r.get("id") == _ally_id), None)
-        if match is None:
-            match = _closest(main_pos, [r for r in robots if r.get("id") not in matched])
+        if main_pos is not None:
+            match = None
+            if _ally_id is not None:
+                match = next((r for r in robots if r.get("id") == _ally_id), None)
+            if match is None:
+                match = _closest(main_pos, [r for r in robots if r.get("id") not in matched])
 
-        if match is not None:
-            rid = match["id"]
-            _ally_id = rid
-            matched.add(rid)
-            sconf = float(match.get("confidence", 1.0))
-            w = main_conf / (main_conf + sconf)
-            match["x"] = round(match["x"] + w * (main_pos[0] - match["x"]), 3)
-            match["y"] = round(match["y"] + w * (main_pos[1] - match["y"]), 3)
-            mb.set("ally_id", str(_ally_id))
-        else:
-            pm = _closest(main_pos, _pred_list(matched))
-            if pm is not None:
-                _ally_id = pm["id"]
-                matched.add(_ally_id)
-                _promote(_ally_id, main_pos, main_conf)
+            if match is not None:
+                rid = match["id"]
+                _ally_id = rid
+                matched.add(rid)
+                sconf = float(match.get("confidence", 1.0))
+                w = main_conf / (main_conf + sconf)
+                match["x"] = round(match["x"] + w * (main_pos[0] - match["x"]), 3)
+                match["y"] = round(match["y"] + w * (main_pos[1] - match["y"]), 3)
                 mb.set("ally_id", str(_ally_id))
+            else:
+                pm = _closest(main_pos, _pred_list(matched))
+                if pm is not None:
+                    _ally_id = pm["id"]
+                    matched.add(_ally_id)
+                    _promote(_ally_id, main_pos, main_conf)
+                    mb.set("ally_id", str(_ally_id))
 
-    # ── 2. Find self among ally's other_pos, then match remaining ─────────────
-    other_pos = list(_ally_data.get("other_pos", []))
+        # ── 2. Find self among ally's other_pos, then match remaining ──────────
+        other_pos = list(_ally_data.get("other_pos", []))
 
-    if _robot_pos is not None:
-        best_d, self_idx = float("inf"), None
-        for i, op in enumerate(other_pos):
-            p = _apos(op)
-            if p is None:
+        if _robot_pos is not None:
+            best_d, self_idx = float("inf"), None
+            for i, op in enumerate(other_pos):
+                p = _apos(op)
+                if p is None:
+                    continue
+                d = math.hypot(p[0] - _robot_pos[0], p[1] - _robot_pos[1])
+                if d < best_d:
+                    best_d, self_idx = d, i
+            if self_idx is not None:
+                other_pos[self_idx] = None
+
+        for op in other_pos:
+            apos  = _apos(op)
+            if apos is None:
                 continue
-            d = math.hypot(p[0] - _robot_pos[0], p[1] - _robot_pos[1])
-            if d < best_d:
-                best_d, self_idx = d, i
-        if self_idx is not None:
-            other_pos[self_idx] = None
+            aconf = _aconf(op)
 
-    for op in other_pos:
-        apos  = _apos(op)
-        if apos is None:
-            continue
-        aconf = _aconf(op)
+            dm = _closest(apos, [r for r in robots if r.get("id") not in matched])
+            if dm is not None:
+                rid = dm["id"]
+                matched.add(rid)
+                sconf = float(dm.get("confidence", 1.0))
+                w = aconf / (aconf + sconf)
+                dm["x"] = round(dm["x"] + w * (apos[0] - dm["x"]), 3)
+                dm["y"] = round(dm["y"] + w * (apos[1] - dm["y"]), 3)
+                continue
 
-        dm = _closest(apos, [r for r in robots if r.get("id") not in matched])
-        if dm is not None:
-            rid = dm["id"]
-            matched.add(rid)
-            sconf = float(dm.get("confidence", 1.0))
-            w = aconf / (aconf + sconf)
-            dm["x"] = round(dm["x"] + w * (apos[0] - dm["x"]), 3)
-            dm["y"] = round(dm["y"] + w * (apos[1] - dm["y"]), 3)
-            continue
+            pm = _closest(apos, _pred_list(matched))
+            if pm is not None:
+                matched.add(pm["id"])
+                _promote(pm["id"], apos, aconf)
 
-        pm = _closest(apos, _pred_list(matched))
-        if pm is not None:
-            matched.add(pm["id"])
-            _promote(pm["id"], apos, aconf)
+        # ── 3. Ally's other_pred ───────────────────────────────────────────────
+        for ap in _ally_data.get("other_pred", []):
+            apos = _apos(ap)
+            if apos is None:
+                continue
 
-    # ── 3. Ally's other_pred ──────────────────────────────────────────────────
-    for ap in _ally_data.get("other_pred", []):
-        apos = _apos(ap)
-        if apos is None:
-            continue
+            # Matched to our detection → ally prediction is redundant, skip
+            if _closest(apos, robots) is not None:
+                continue
 
-        # Matched to our detection → ally prediction is redundant, skip
-        if _closest(apos, robots) is not None:
-            continue
+            # Matched to our prediction → average the two
+            pm = _closest(apos, _pred_list())
+            if pm is not None:
+                tid = pm["id"]
+                tr  = _tracked[tid]
+                tr["x"] = round((tr["x"] + apos[0]) / 2, 3)
+                tr["y"] = round((tr["y"] + apos[1]) / 2, 3)
 
-        # Matched to our prediction → average the two
-        pm = _closest(apos, _pred_list())
-        if pm is not None:
-            tid = pm["id"]
-            tr  = _tracked[tid]
-            tr["x"] = round((tr["x"] + apos[0]) / 2, 3)
-            tr["y"] = round((tr["y"] + apos[1]) / 2, 3)
+    with _perf.measure("ally_ball"):
+        ally_ball_d = _ally_data.get("ball_pos")
+        if ally_ball_d is not None:
+            apos  = _apos(ally_ball_d)
+            aconf = _aconf(ally_ball_d)
+            if apos is not None:
+                if _sys_ball_pos is not None:
+                    sconf = float(_sys_ball_pos.get("confidence", 1.0))
+                    total = aconf + sconf
+                    mb.set("ball_pos", json.dumps({
+                        "x": round((sconf * _sys_ball_pos["x"] + aconf * apos[0]) / total, 3),
+                        "y": round((sconf * _sys_ball_pos["y"] + aconf * apos[1]) / total, 3),
+                        "confidence": round((sconf + aconf) / 2, 3),
+                    }))
+                else:
+                    mb.set("ball_pos", json.dumps({
+                        "x": round(apos[0], 3), "y": round(apos[1], 3),
+                        "confidence": round(aconf, 3),
+                    }))
 
 
 # ── Broker callback ───────────────────────────────────────────────────────────
@@ -526,6 +548,7 @@ def on_update(key, value):
     global _imu_pitch, _lidar, _lidar_walls, _robot_pos
     global _robots_last_t, _ball_last_t
     global _ally_data, _ally_data_t
+    global _sys_ball_pos
 
     if value is None:
         return
@@ -609,17 +632,21 @@ def on_update(key, value):
 
     if key == "ball":
         now = time.monotonic()
-        if now - _ball_last_t < BALL_SAMPLE_S:
-            return
         try:
             pos = json.loads(value).get("global_pos")
             if pos is None:
                 return
-            entry = {"x": float(pos["x"]), "y": float(pos["y"]),
-                     "t": round(_elapsed(), 3)}
+            _sys_ball_pos = {
+                "x": float(pos["x"]), "y": float(pos["y"]),
+                "confidence": float(pos.get("confidence", 1.0)),
+            }
         except Exception:
             return
+        if now - _ball_last_t < BALL_SAMPLE_S:
+            return
         _ball_last_t = now
+        entry = {"x": _sys_ball_pos["x"], "y": _sys_ball_pos["y"],
+                 "t": round(_elapsed(), 3)}
         with _ball_lock:
             _ball_history.append(entry)
             _prune_list(_ball_history)
