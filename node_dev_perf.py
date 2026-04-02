@@ -48,7 +48,7 @@ HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
 HOME        = "\033[H"
 
-_COL_NODE = 20
+_COL_NODE = 30
 _COL_KEY  = 18
 _COL_VAL  =  9   # width of the bare number field (e.g. "  123.4ms")
 _SEP_W    = _COL_NODE + _COL_KEY + (_COL_VAL + 2) * 2 + 10
