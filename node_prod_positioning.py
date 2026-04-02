@@ -32,6 +32,7 @@ VEL_HISTORY_N      = 10
 VEL_HISTORY_MIN    = 3
 MAX_ROBOT_SPEED    = 2.0
 _MAX_PRED_DT       = 0.5
+MAX_CORRECTION_AGE = 0.5   # seconds — ignore ally corrections older than this
 
 # ── Time / history ────────────────────────────────────────────────────────────
 TIME_PUBLISH_HZ   = 10
@@ -54,9 +55,11 @@ _lidar     = {}     # angle_deg (int) → dist_mm (int)
 _lidar_walls = []   # [{"gradient": 0|None, "offset": float}, ...]
 
 # ── Robot detection & tracking state ─────────────────────────────────────────
-_robot_pos = None   # (x, y) metres — updated after each position computation
-_tracked   = {}     # id → {"x","y","vx","vy","t","history"}
-_next_id   = 1
+_robot_pos          = None  # (x, y) metres — updated after each position computation
+_tracked            = {}    # id → {"x","y","vx","vy","t","history"}
+_next_id            = 1
+_ally_corrections   = {}    # id → {dx, dy, conf}
+_ally_corrections_t = 0.0   # monotonic time of last ally_corrections update
 
 # ── Time node state ───────────────────────────────────────────────────────────
 _time_start     = time.monotonic()
@@ -361,8 +364,21 @@ def _detect_and_track_robots(rel_pts, robot_pos_arr, fa_rad, now):
 def on_update(key, value):
     global _imu_pitch, _lidar, _lidar_walls, _robot_pos
     global _robots_last_t, _ball_last_t
+    global _ally_corrections, _ally_corrections_t
 
     if value is None:
+        return
+
+    if key == "ally_corrections":
+        try:
+            payload = json.loads(value)
+            _ally_corrections = {
+                int(c["id"]): {"dx": float(c["dx"]), "dy": float(c["dy"]), "conf": float(c["conf"])}
+                for c in payload.get("corrections", []) if c.get("id") is not None
+            }
+            _ally_corrections_t = float(payload.get("t", 0.0))
+        except Exception:
+            pass
         return
 
     if key == "imu_pitch":
@@ -409,6 +425,14 @@ def on_update(key, value):
                 robots, origin = _detect_and_track_robots(rel_pts, robot_pos_arr,
                                                           fa_rad, now)
                 if robots is not None:
+                    if _ally_corrections and (now - _ally_corrections_t) < MAX_CORRECTION_AGE:
+                        for robot in robots:
+                            rid = robot.get("id")
+                            if rid in _ally_corrections:
+                                c = _ally_corrections[rid]
+                                w = c["conf"] / (c["conf"] + float(robot.get("confidence", 1.0)))
+                                robot["x"] = round(robot["x"] + w * c["dx"], 3)
+                                robot["y"] = round(robot["y"] + w * c["dy"], 3)
                     mb.set("other_robots_detected",
                            json.dumps({"origin": origin, "robots": robots, "t": now}))
         return
@@ -464,7 +488,7 @@ if __name__ == "__main__":
     threading.Thread(target=_time_loop, daemon=True, name="time-publisher").start()
 
     # robot_position is produced internally — no subscription needed
-    mb.setcallback(["lidar", "imu_pitch", "other_robots", "ball"], on_update)
+    mb.setcallback(["lidar", "imu_pitch", "other_robots", "ball", "ally_corrections"], on_update)
     print("[POSITIONING] Starting combined positioning node...")
     try:
         mb.receiver_loop()
