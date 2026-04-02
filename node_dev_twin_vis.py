@@ -40,7 +40,7 @@ _ball_history         = []    # [{"x", "y", "t"}, ...] from ball_history key
 _sim_ball_pos         = None  # {"x": float, "y": float} or None — true sim position
 _sim_state            = None  # {"robot": [x,y], "obstacles": [[x,y],...]} from sim_state key
 _ally_id              = None  # persistent ally robot ID from cooperation node
-_ally_pos_raw         = {}    # "ally_main_robot_pos" / "ally_other_pos_N" → {"x","y"}
+_ally_pos_raw         = {}    # "ally_main_robot_pos" / "ally_other_pos_N" / "ally_ball_pos" → {"x","y"}
 
 _state_lock   = threading.Lock()
 _needs_redraw = threading.Event()
@@ -167,6 +167,7 @@ def _ally_marker(marker):
 
 _art_ally_main = _ally_marker('D')
 _art_ally_det  = [_ally_marker('x') for _ in range(_MAX_ALLY_OTHERS)]
+_art_ally_ball = _ally_marker('*')   # ally's detected ball position
 
 # Status text (inside axes, top-left corner)
 _art_status = ax.text(0.01, 0.99, '', transform=ax.transAxes,
@@ -241,7 +242,7 @@ def _redraw():
             ox, oy    = r[0], r[1]
             method    = str(r[2]) if len(r) > 2 else ""
             rid       = int(r[3]) if len(r) > 3 else 0
-            is_ally   = (_ally_id is not None and rid == _ally_id)
+            is_ally   = (bool(r[4]) if len(r) > 4 else False) or (_ally_id is not None and rid == _ally_id)
             predicted = method == "predicted"
             c_solid   = _ALLY_BLUE if is_ally else (0.90, 0.22, 0.18)
             c_face    = c_solid + (0.15 if predicted else 0.3,)
@@ -331,6 +332,8 @@ def _redraw():
     for i, art in enumerate(_art_ally_det):
         p = _ally_pos_raw.get(f"ally_other_pos_{i + 1}")
         art.set_data([p["x"]], [p["y"]]) if p else art.set_data([], [])
+    p = _ally_pos_raw.get("ally_ball_pos")
+    _art_ally_ball.set_data([p["x"]], [p["y"]]) if p else _art_ally_ball.set_data([], [])
 
     # ── Walls ─────────────────────────────────────────────────────────────────
     _update_wall_lines(_walls, _art_walls, origin)
@@ -355,7 +358,7 @@ def _redraw():
             alpha = 0.05 + 0.6 * (snap["t"] - t0) / rng
             for r in snap["robots"]:
                 rid = int(r.get("id", 0))
-                c   = _ALLY_BLUE if (_ally_id is not None and rid == _ally_id) else (0.90, 0.22, 0.18)
+                c   = _ALLY_BLUE if (_ally_id is not None and rid == _ally_id) else (0.90, 0.22, 0.18)  # history lacks ally flag → use id
                 pts.append((r["x"], r["y"]))
                 rgba.append(c + (alpha,))
         if pts:
@@ -381,7 +384,7 @@ def _redraw():
         _art_arrow,
         _art_ball, _art_ball_hidden, _art_ball_hist, _art_ball_arrow,
         _art_sim_ball, _art_sim_self, *_art_sim_obs,
-        _art_ally_main, *_art_ally_det,
+        _art_ally_main, *_art_ally_det, _art_ally_ball,
         *_art_walls,
         _art_pos_hist, _art_bot_hist,
         _art_status,
@@ -461,7 +464,7 @@ def on_update(key, value):
                     _ally_id = None
 
             elif key in ("ally_main_robot_pos", "ally_other_pos_1",
-                         "ally_other_pos_2", "ally_other_pos_3"):
+                         "ally_other_pos_2", "ally_other_pos_3", "ally_ball_pos"):
                 try:
                     p = json.loads(value)
                     _ally_pos_raw[key] = {"x": float(p["x"]), "y": float(p["y"])}
@@ -516,7 +519,7 @@ if __name__ == "__main__":
     _redraw()           # first blit pass
 
     _ally_keys = ["ally_main_robot_pos", "ally_other_pos_1",
-                  "ally_other_pos_2", "ally_other_pos_3"]
+                  "ally_other_pos_2", "ally_other_pos_3", "ally_ball_pos"]
     mb.setcallback(list(_SEEDS.keys()) + _ally_keys, on_update)
     threading.Thread(target=mb.receiver_loop, daemon=True,
                      name="broker-receiver").start()
