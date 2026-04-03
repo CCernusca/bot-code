@@ -39,7 +39,7 @@ SIM_REPLACE = True  # Set True to force simulated ball even if a camera is found
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_vision", broker=mb, print_every=100)
+_perf = PerfMonitor("node_dev_vision", broker=mb, print_every=100)
 
 _robot_pos = None   # (x, y) metres — from robot_position broker key
 _imu_pitch = None   # degrees       — from imu_pitch broker key

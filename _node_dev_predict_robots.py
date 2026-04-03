@@ -16,7 +16,7 @@ _MAX_PRED_DT    = 0.5
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_predict_robots", broker=mb)
+_perf = PerfMonitor("node_dev_predict_robots", broker=mb)
 
 # Cache of last known state per tracked robot ID, populated from other_robots_detected.
 _robot_last = {}   # id → {"x", "y", "vx", "vy", "t"}

@@ -20,7 +20,7 @@ DEBUG = False   # set True to print per-update positioning details
 # ──────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_pos", broker=mb)
+_perf = PerfMonitor("node_dev_pos", broker=mb)
 
 _imu_pitch   = None   # degrees — from imu_pitch broker key
 _lidar       = {}     # {angle_deg: dist_mm}
