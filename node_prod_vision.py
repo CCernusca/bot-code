@@ -33,7 +33,7 @@ FIELD_HEIGHT = 2.43
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball_raw"
 
-SIM_REPLACE = False  # Auf False gesetzt, damit du direkt deine Pi Camera V2 nutzen kannst!
+SIM_REPLACE = True  # Auf False gesetzt, damit du direkt deine Pi Camera V2 nutzen kannst!
 
 # ── ADAPTIVE EXPONENTIAL MOVING AVERAGE (AEMA) SETUP ──────────────────────────
 # Dies ist ein effizienter 1D-Kalman-ähnlicher Filter für RPi Zero
