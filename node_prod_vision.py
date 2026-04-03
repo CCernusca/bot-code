@@ -5,7 +5,6 @@ import math
 import numpy as np
 import threading
 import time
-import collections
 
 # ── Camera specifications (Raspberry Pi Cam V2) ────────────────────────────────
 FOV_DEG    = 62.2
@@ -14,12 +13,12 @@ RES_HEIGHT = 120   # <--- NEU: Ultra-Low-Res
 CENTER_X   = RES_WIDTH / 2.0
 
 # ── Colour filter (HSV) ────────────────────────────────────────────────────────
-LOWER_ORANGE = (5, 27, 190)
-UPPER_ORANGE = (25, 147, 255)
+LOWER_ORANGE = (2, 66, 242)
+UPPER_ORANGE = (43, 123, 255)
 
 # ── Detection thresholds ───────────────────────────────────────────────────────
-DEADZONE_PIXELS = 10  # <--- NEU: Skaliert auf die kleinere Breite
-MIN_RADIUS      = 2   # <--- NEU: Ball ist in Pixeln kleiner, also muss der Mindestradius runter
+DEADZONE_PIXELS = 10  # Toleranz-Bereich für "FORWARD" in der Mitte
+MIN_RADIUS      = 1   # Ball ist sehr klein in 160x120, daher Mindestradius 1 Pixel
 
 # ── Ball physical size ─────────────────────────────────────────────────────────
 BALL_RADIUS_MM = 21.0
@@ -34,29 +33,72 @@ FIELD_HEIGHT = 2.43
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball_raw"
 
-SIM_REPLACE = False
+SIM_REPLACE = False  # Auf False gesetzt, damit du direkt deine Pi Camera V2 nutzen kannst!
 
-# ── STABILIZATION (SMA & OUTLIER FILTER) SETUP ─────────────────────────────────
-HISTORY_SIZE = 3          # Average over the last 3 frames
-MAX_DIST_JUMP_CM = 40.0   # If distance jumps > 40cm in one frame -> outlier
-MAX_ANGLE_JUMP_DEG = 30.0 # If angle jumps > 30 degrees in one frame -> outlier
-MAX_OUTLIER_STRIKES = 3   # Accept the jump if it persists for 3 frames
+# ── ADAPTIVE EXPONENTIAL MOVING AVERAGE (AEMA) SETUP ──────────────────────────
+# Dies ist ein effizienter 1D-Kalman-ähnlicher Filter für RPi Zero
+# Er passt die Glättung einstellbar an die Bewegungsgeschwindigkeit an:
+# - Bei kleinen Änderungen (Rauschen): Alpha ≈ 0.1 (starke Glättung)
+# - Bei großen Änderungen (echte Bewegung): Alpha ≈ 0.5 (schnelle Reaktion)
 
-_dist_hist = collections.deque(maxlen=HISTORY_SIZE)
-_angle_hist = collections.deque(maxlen=HISTORY_SIZE)
-_x_hist = collections.deque(maxlen=HISTORY_SIZE)
-_radius_hist = collections.deque(maxlen=HISTORY_SIZE)
+_aema_dist = None      # Current estimate für Distanz
+_aema_angle = None     # Current estimate für Winkel
+_aema_x = None         # Current estimate für X-Position
+_aema_radius = None    # Current estimate für Radius
 
-_outlier_strikes = 0
+# AEMA Parameter
+AEMA_ALPHA_MIN = 0.08  # Minimale Glättung (bei Rauschen)
+AEMA_ALPHA_MAX = 0.5   # Maximale Reaktion (bei schneller Bewegung)
+AEMA_THRESHOLD = 0.15  # Schwelle zur Aktivierung von Alpha_max (proportional zur Änderung)
+
+
+class AdaptiveEMA:
+    """
+    Lightweight adaptive Exponential Moving Average Filter.
+    Reagiert schnell auf echte Bewegungen, glättet aber aggressiv bei Rauschen.
+    CPU-Kosten: ~5 Multiplikationen + 3 Vergleiche pro Frame (sehr effizient).
+    """
+    def __init__(self, alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD):
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.threshold = threshold
+        self.estimate = None
+    
+    def update(self, measurement):
+        """Update filter with new measurement. Returns smoothed estimate."""
+        if self.estimate is None:
+            # Erste Messung: Initialisiere mit dem Messwert
+            self.estimate = measurement
+            return measurement
+        
+        # Berechne relative Änderung (normalisiert auf Prozentanteil)
+        if abs(self.estimate) > 1e-6:
+            relative_change = abs(measurement - self.estimate) / abs(self.estimate)
+        else:
+            relative_change = abs(measurement - self.estimate)
+        
+        # Adaptive Alpha: große Sprünge = schnäller Filter, kleine Sprünge = starke Glättung
+        if relative_change > self.threshold:
+            alpha = self.alpha_max  # Schnelle Reaktion auf echte Bewegung
+        else:
+            alpha = self.alpha_min  # Starke Glättung bei Rauschen
+        
+        # Exponential Moving Average Update (sehr effizient)
+        self.estimate = alpha * measurement + (1.0 - alpha) * self.estimate
+        return self.estimate
+    
+    def reset(self):
+        """Reset filter state when ball leaves FOV."""
+        self.estimate = None
+
 
 def _reset_filters():
-    """Clears the queues when the ball is lost or teleports."""
-    global _outlier_strikes
-    _dist_hist.clear()
-    _angle_hist.clear()
-    _x_hist.clear()
-    _radius_hist.clear()
-    _outlier_strikes = 0
+    """Löscht die AEMA-Filter, wenn der Ball das Sichtfeld verlässt."""
+    global _aema_dist, _aema_angle, _aema_x, _aema_radius
+    _aema_dist.reset()
+    _aema_angle.reset()
+    _aema_x.reset()
+    _aema_radius.reset()
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
@@ -65,6 +107,12 @@ _perf = PerfMonitor("node_prod_vision", broker=mb, print_every=100)
 _robot_pos = None
 _imu_pitch = None
 _sim_state = None
+
+# Initialisiere AEMA Filter (global)
+_aema_dist = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
+_aema_angle = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
+_aema_x = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
+_aema_radius = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
 
 _hw_available = False
 try:
@@ -75,12 +123,16 @@ except ImportError as e:
 
 
 def _process_frame(frame):
+    """
+    Verarbeitet Frame mit HSV-Filterung und Konturerkennung.
+    Optimiert für 160x120 Auflösung und Pi Camera V2.
+    """
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv,
                        np.array(LOWER_ORANGE),
                        np.array(UPPER_ORANGE))
 
-    # <--- NEU: Nur 1 Iteration, damit der kleine Ball nicht weggefiltert wird!
+    # Nur 1 Iteration bei 160x120, sonst löschen wir den Ball versehentlich!
     mask = cv2.erode(mask,  None, iterations=1) 
     mask = cv2.dilate(mask, None, iterations=1)
 
@@ -98,6 +150,7 @@ def _process_frame(frame):
         return {"command": "NO_BALL", "distance_cm": 0.0,
                 "angle_deg": 0.0, "x_center": -1, "radius": -1}
 
+    # --- DIE MATHEMATIK (Angepasst für 62.2° FOV der Pi Camera V2) ---
     diameter_px = radius * 2.0
     Ow_deg = (FOV_DEG / RES_WIDTH) * diameter_px
     Ow_rad = math.radians(Ow_deg)
@@ -304,7 +357,7 @@ if __name__ == "__main__":
     threading.Thread(target=mb.receiver_loop, daemon=True,
                      name="broker-receiver").start()
 
-    print("[VISION] Starting headless vision system with SMA and Outlier Rejection...")
+    print("[VISION] Starting headless vision system for Raspberry Pi Camera V2...")
 
     if SIM_REPLACE:
         cap = None
@@ -325,6 +378,8 @@ if __name__ == "__main__":
             sim = _SimBall()
             print("[VISION] Camera not available — falling back to simulated ball.")
 
+    print(f"[VISION] Using Raspberry Pi Camera V2 (FOV={FOV_DEG}° @ {RES_WIDTH}x{RES_HEIGHT})")
+    print(f"[VISION] Smoothing: Adaptive EMA (Alpha_min={AEMA_ALPHA_MIN}, Alpha_max={AEMA_ALPHA_MAX}, Threshold={AEMA_THRESHOLD})")
     last_log_time = time.time()
 
     try:
@@ -336,52 +391,31 @@ if __name__ == "__main__":
                 if not ret:
                     print("[VISION] ERROR: Camera connection lost!")
                     break
+                
+                # ---> DIESE ZEILE HAT CLAUDE VERGESSEN! <---
+                # Wir zwingen das Bild der Webcam gnadenlos auf 160x120!
+                frame = cv2.resize(frame, (RES_WIDTH, RES_HEIGHT), interpolation=cv2.INTER_NEAREST)
 
             with _perf.measure("frame"):
                 result = _process_frame(frame)
 
                 if result["command"] != "NO_BALL":
-                    new_dist = result["distance_cm"]
-                    new_angle = result["angle_deg"]
-                    new_x = result["x_center"]
-                    new_rad = result["radius"]
+                    # Raw messwerte vom Detektor
+                    raw_dist = result["distance_cm"]
+                    raw_angle = result["angle_deg"]
+                    raw_x = result["x_center"]
+                    raw_rad = result["radius"]
 
-                    is_outlier = False
+                    # ════════════════════════════════════════════════════════════════════
+                    # ADAPTIVE EXPONENTIAL MOVING AVERAGE (AEMA)
+                    # Intelligente Glättung: schnell bei Bewegung, stark glatt bei Rauschen
+                    # ════════════════════════════════════════════════════════════════════
+                    result["distance_cm"] = round(_aema_dist.update(raw_dist), 1)
+                    result["angle_deg"]   = round(_aema_angle.update(raw_angle), 1)
+                    result["x_center"]    = round(_aema_x.update(raw_x), 1)
+                    result["radius"]      = round(_aema_radius.update(raw_rad), 1)
 
-                    # 1. OUTLIER DETECTION
-                    if len(_dist_hist) > 0:
-                        avg_dist = sum(_dist_hist) / len(_dist_hist)
-                        avg_angle = sum(_angle_hist) / len(_angle_hist)
-
-                        if abs(new_dist - avg_dist) > MAX_DIST_JUMP_CM or abs(new_angle - avg_angle) > MAX_ANGLE_JUMP_DEG:
-                            _outlier_strikes += 1
-                            if _outlier_strikes >= MAX_OUTLIER_STRIKES:
-                                # Not a glitch. The ball actually moved drastically.
-                                _reset_filters()
-                            else:
-                                is_outlier = True
-
-                    if is_outlier:
-                        # Override glitchy data with our stable averages, do NOT append to queue
-                        result["distance_cm"] = round(sum(_dist_hist) / len(_dist_hist), 1)
-                        result["angle_deg"]   = round(sum(_angle_hist) / len(_angle_hist), 1)
-                        result["x_center"]    = round(sum(_x_hist) / len(_x_hist), 1)
-                        result["radius"]      = round(sum(_radius_hist) / len(_radius_hist), 1)
-                    else:
-                        # 2. ADD GOOD DATA TO QUEUES
-                        _outlier_strikes = 0
-                        _dist_hist.append(new_dist)
-                        _angle_hist.append(new_angle)
-                        _x_hist.append(new_x)
-                        _radius_hist.append(new_rad)
-
-                        # 3. CALCULATE THE SIMPLE MOVING AVERAGE
-                        result["distance_cm"] = round(sum(_dist_hist) / len(_dist_hist), 1)
-                        result["angle_deg"]   = round(sum(_angle_hist) / len(_angle_hist), 1)
-                        result["x_center"]    = round(sum(_x_hist) / len(_x_hist), 1)
-                        result["radius"]      = round(sum(_radius_hist) / len(_radius_hist), 1)
-
-                    # 4. COMPUTE STEERING COMMAND BASED ON AVERAGED X
+                    # 4. COMPUTE STEERING COMMAND BASED ON SMOOTHED X
                     error_x = result["x_center"] - CENTER_X
                     if error_x < -DEADZONE_PIXELS:
                         result["command"] = "LEFT"
@@ -390,7 +424,6 @@ if __name__ == "__main__":
                     else:
                         result["command"] = "FORWARD"
                 else:
-                    # Clear history if the ball leaves the screen entirely
                     _reset_filters()
 
                 # --- GLOBAL POSITION & BROKER ---
@@ -404,16 +437,15 @@ if __name__ == "__main__":
                     result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
 
-            # Logging
+            # Logging (every 1 second)
             now = time.time()
             if now - last_log_time >= 1.0:
                 if result["command"] == "NO_BALL":
                     print("[VISION] Status: NO_BALL")
                 else:
-                    outlier_warn = " (OUTLIER IGNORED)" if is_outlier else ""
                     print(f"[VISION] Status: {result['command']} | "
                           f"Distance: {result['distance_cm']:.1f} cm | "
-                          f"Angle: {result['angle_deg']:.1f} deg{outlier_warn}")
+                          f"Angle: {result['angle_deg']:.1f} deg")
                 last_log_time = now
 
     except KeyboardInterrupt:
