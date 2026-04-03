@@ -5,20 +5,21 @@ import math
 import numpy as np
 import threading
 import time
+import collections
 
 # ── Camera specifications (Raspberry Pi Cam V2) ────────────────────────────────
 FOV_DEG    = 62.2
-RES_WIDTH  = 640
-RES_HEIGHT = 480
+RES_WIDTH  = 160   # <--- NEU: Ultra-Low-Res (Spart massiv CPU!)
+RES_HEIGHT = 120   # <--- NEU: Ultra-Low-Res
 CENTER_X   = RES_WIDTH / 2.0
 
 # ── Colour filter (HSV) ────────────────────────────────────────────────────────
-LOWER_ORANGE = (5,  120, 100)
-UPPER_ORANGE = (25, 255, 255)
+LOWER_ORANGE = (5, 27, 190)
+UPPER_ORANGE = (25, 147, 255)
 
 # ── Detection thresholds ───────────────────────────────────────────────────────
-DEADZONE_PIXELS = 40
-MIN_RADIUS      = 5
+DEADZONE_PIXELS = 10  # <--- NEU: Skaliert auf die kleinere Breite
+MIN_RADIUS      = 2   # <--- NEU: Ball ist in Pixeln kleiner, also muss der Mindestradius runter
 
 # ── Ball physical size ─────────────────────────────────────────────────────────
 BALL_RADIUS_MM = 21.0
@@ -33,8 +34,29 @@ FIELD_HEIGHT = 2.43
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball_raw"
 
-SIM_REPLACE = True
+SIM_REPLACE = False
 
+# ── STABILIZATION (SMA & OUTLIER FILTER) SETUP ─────────────────────────────────
+HISTORY_SIZE = 3          # Average over the last 3 frames
+MAX_DIST_JUMP_CM = 40.0   # If distance jumps > 40cm in one frame -> outlier
+MAX_ANGLE_JUMP_DEG = 30.0 # If angle jumps > 30 degrees in one frame -> outlier
+MAX_OUTLIER_STRIKES = 3   # Accept the jump if it persists for 3 frames
+
+_dist_hist = collections.deque(maxlen=HISTORY_SIZE)
+_angle_hist = collections.deque(maxlen=HISTORY_SIZE)
+_x_hist = collections.deque(maxlen=HISTORY_SIZE)
+_radius_hist = collections.deque(maxlen=HISTORY_SIZE)
+
+_outlier_strikes = 0
+
+def _reset_filters():
+    """Clears the queues when the ball is lost or teleports."""
+    global _outlier_strikes
+    _dist_hist.clear()
+    _angle_hist.clear()
+    _x_hist.clear()
+    _radius_hist.clear()
+    _outlier_strikes = 0
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
@@ -58,8 +80,9 @@ def _process_frame(frame):
                        np.array(LOWER_ORANGE),
                        np.array(UPPER_ORANGE))
 
-    mask = cv2.erode(mask,  None, iterations=2)
-    mask = cv2.dilate(mask, None, iterations=2)
+    # <--- NEU: Nur 1 Iteration, damit der kleine Ball nicht weggefiltert wird!
+    mask = cv2.erode(mask,  None, iterations=1) 
+    mask = cv2.dilate(mask, None, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
@@ -83,19 +106,12 @@ def _process_frame(frame):
     error_x   = x_center - CENTER_X
     angle_deg = (error_x / RES_WIDTH) * FOV_DEG
 
-    if error_x < -DEADZONE_PIXELS:
-        command = "LEFT"
-    elif error_x > DEADZONE_PIXELS:
-        command = "RIGHT"
-    else:
-        command = "FORWARD"
-
     return {
-        "command":     command,
-        "distance_cm": round(distance_cm, 1),
-        "angle_deg":   round(angle_deg, 1),
-        "x_center":    round(float(x_center), 1),
-        "radius":      round(float(radius), 1),
+        "command":     "FOUND", 
+        "distance_cm": distance_cm,
+        "angle_deg":   angle_deg,
+        "x_center":    float(x_center),
+        "radius":      float(radius),
     }
 
 
@@ -288,7 +304,7 @@ if __name__ == "__main__":
     threading.Thread(target=mb.receiver_loop, daemon=True,
                      name="broker-receiver").start()
 
-    print("[VISION] Starting headless vision system...")
+    print("[VISION] Starting headless vision system with SMA and Outlier Rejection...")
 
     if SIM_REPLACE:
         cap = None
@@ -324,6 +340,60 @@ if __name__ == "__main__":
             with _perf.measure("frame"):
                 result = _process_frame(frame)
 
+                if result["command"] != "NO_BALL":
+                    new_dist = result["distance_cm"]
+                    new_angle = result["angle_deg"]
+                    new_x = result["x_center"]
+                    new_rad = result["radius"]
+
+                    is_outlier = False
+
+                    # 1. OUTLIER DETECTION
+                    if len(_dist_hist) > 0:
+                        avg_dist = sum(_dist_hist) / len(_dist_hist)
+                        avg_angle = sum(_angle_hist) / len(_angle_hist)
+
+                        if abs(new_dist - avg_dist) > MAX_DIST_JUMP_CM or abs(new_angle - avg_angle) > MAX_ANGLE_JUMP_DEG:
+                            _outlier_strikes += 1
+                            if _outlier_strikes >= MAX_OUTLIER_STRIKES:
+                                # Not a glitch. The ball actually moved drastically.
+                                _reset_filters()
+                            else:
+                                is_outlier = True
+
+                    if is_outlier:
+                        # Override glitchy data with our stable averages, do NOT append to queue
+                        result["distance_cm"] = round(sum(_dist_hist) / len(_dist_hist), 1)
+                        result["angle_deg"]   = round(sum(_angle_hist) / len(_angle_hist), 1)
+                        result["x_center"]    = round(sum(_x_hist) / len(_x_hist), 1)
+                        result["radius"]      = round(sum(_radius_hist) / len(_radius_hist), 1)
+                    else:
+                        # 2. ADD GOOD DATA TO QUEUES
+                        _outlier_strikes = 0
+                        _dist_hist.append(new_dist)
+                        _angle_hist.append(new_angle)
+                        _x_hist.append(new_x)
+                        _radius_hist.append(new_rad)
+
+                        # 3. CALCULATE THE SIMPLE MOVING AVERAGE
+                        result["distance_cm"] = round(sum(_dist_hist) / len(_dist_hist), 1)
+                        result["angle_deg"]   = round(sum(_angle_hist) / len(_angle_hist), 1)
+                        result["x_center"]    = round(sum(_x_hist) / len(_x_hist), 1)
+                        result["radius"]      = round(sum(_radius_hist) / len(_radius_hist), 1)
+
+                    # 4. COMPUTE STEERING COMMAND BASED ON AVERAGED X
+                    error_x = result["x_center"] - CENTER_X
+                    if error_x < -DEADZONE_PIXELS:
+                        result["command"] = "LEFT"
+                    elif error_x > DEADZONE_PIXELS:
+                        result["command"] = "RIGHT"
+                    else:
+                        result["command"] = "FORWARD"
+                else:
+                    # Clear history if the ball leaves the screen entirely
+                    _reset_filters()
+
+                # --- GLOBAL POSITION & BROKER ---
                 gpos = None
                 if result["command"] != "NO_BALL":
                     gpos = _compute_global_pos(result["distance_cm"], result["angle_deg"])
@@ -334,14 +404,16 @@ if __name__ == "__main__":
                     result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
 
+            # Logging
             now = time.time()
             if now - last_log_time >= 1.0:
                 if result["command"] == "NO_BALL":
-                    print("[VISION] Status: NO BALL")
+                    print("[VISION] Status: NO_BALL")
                 else:
+                    outlier_warn = " (OUTLIER IGNORED)" if is_outlier else ""
                     print(f"[VISION] Status: {result['command']} | "
                           f"Distance: {result['distance_cm']:.1f} cm | "
-                          f"Angle: {result['angle_deg']:.1f} deg")
+                          f"Angle: {result['angle_deg']:.1f} deg{outlier_warn}")
                 last_log_time = now
 
     except KeyboardInterrupt:
