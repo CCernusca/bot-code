@@ -31,7 +31,7 @@ _other_robots      = []
 _walls                = []
 _position_history     = []
 _other_robots_history = []
-_ball_pos             = None  # {"x": float, "y": float} or None — detected position
+_ball_pos             = None  # {"x": float, "y": float} or None — best available: ally-fused or raw detection
 _ball_hidden_pos      = None  # {"x": float, "y": float} or None — extrapolated while hidden
 _ball_lost            = False # True when prediction is in FOV but ball not detected
 _ball_vx              = None  # m/s — fitted horizontal velocity
@@ -443,13 +443,19 @@ def on_update(key, value):
                 _other_robots_history = json.loads(value)
 
             elif key == "ball":
-                payload           = json.loads(value)
+                payload          = json.loads(value)
                 _ball_pos        = payload.get("global_pos")
                 _ball_hidden_pos = payload.get("hidden_pos")
                 _ball_lost       = bool(payload.get("ball_lost", False))
                 _ball_vx         = payload.get("vx")
                 _ball_vy         = payload.get("vy")
                 _sim_ball_pos    = payload.get("sim_pos")
+
+            elif key == "ball_pos":
+                # Ally-fused best estimate from positioning; overrides raw detection
+                # when fresh — falls back to ball.global_pos when fusion is inactive
+                p = json.loads(value)
+                _ball_pos = {"x": float(p["x"]), "y": float(p["y"])}
 
             elif key == "ball_history":
                 _ball_history = json.loads(value)
@@ -520,7 +526,7 @@ if __name__ == "__main__":
 
     _ally_keys = ["ally_main_robot_pos", "ally_other_pos_1",
                   "ally_other_pos_2", "ally_other_pos_3", "ally_ball_pos"]
-    mb.setcallback(list(_SEEDS.keys()) + _ally_keys, on_update)
+    mb.setcallback(list(_SEEDS.keys()) + _ally_keys + ["ball_pos"], on_update)
     threading.Thread(target=mb.receiver_loop, daemon=True,
                      name="broker-receiver").start()
 
