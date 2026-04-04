@@ -1,61 +1,39 @@
 """
 node_dev_web_vis — Browser-based live field visualisation.
 
-Renders exactly the same view as node_dev_twin_vis using matplotlib's Agg
-(non-interactive) backend and serves it over HTTP so any browser on the
-local network can follow the live state without needing a display.
+State is pushed to the browser via Server-Sent Events (SSE) as compact JSON.
+The browser renders everything with HTML5 Canvas — no matplotlib, no PNG
+encoding, no image transfer.  Frame rate is limited only by the browser's
+requestAnimationFrame and the rate at which the broker emits updates.
 
 Default URL:  http://localhost:5050/
-Frame rate:   RENDER_HZ (default 10 fps)
 """
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "robus-core"))
 
-import io
 import json
 import math
 import threading
-import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.lines import Line2D
-from matplotlib.patches import FancyArrowPatch
-import numpy as np
 
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 
 # ── Config ────────────────────────────────────────────────────────────────────
-HOST      = "0.0.0.0"
-PORT      = 5050
-RENDER_HZ = 10
-
-# ── Field configuration (must match other nodes) ──────────────────────────────
-FIELD_WIDTH  = 1.58
-FIELD_HEIGHT = 2.19
-ROBOT_RADIUS = 0.09
-OUTER_MARGIN = 0.12
-GOAL_WIDTH   = 0.60
-_MARGIN         = 0.10
-_MAX_VIS_ROBOTS = 3
-_MAX_WALLS      = 4
+HOST = "0.0.0.0"
+PORT = 5050
 
 # ─────────────────────────────────────────────────────────────────────────────
-
 mb = TelemetryBroker()
 
-# ── Broker state ──────────────────────────────────────────────────────────────
+# ── Broker state (same variables as node_dev_twin_vis) ────────────────────────
 _state_lock           = threading.Lock()
 _lidar                = {}
 _detection_origin     = None
-_detection_heading    = None
-_imu_pitch            = None
-_robot_pos            = None
-_other_robots         = []
+_detection_heading    = None   # radians
+_imu_pitch            = None   # degrees
+_robot_pos            = None   # (x, y)
+_other_robots         = []     # [[x,y,method,id,ally], ...]
 _walls                = []
 _position_history     = []
 _other_robots_history = []
@@ -65,491 +43,519 @@ _ball_lost            = False
 _ball_vx              = None
 _ball_vy              = None
 _ball_history         = []
-_sim_ball_pos         = None
-_sim_state            = None
 _ally_id              = None
 _ally_pos_raw         = {}
 _raw_robots           = None
 _ball_raw             = None
 _field_sectors        = None
 
-
-def _heading():
-    return _imu_pitch if _imu_pitch is not None else 0.0
-
-
-# ── Matplotlib setup ──────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(6, 9))
-plt.tight_layout(pad=1.5)
-
-_OW = OUTER_MARGIN
-ax.set_xlim(-_OW - _MARGIN, FIELD_WIDTH  + _OW + _MARGIN)
-ax.set_ylim(-_OW - _MARGIN, FIELD_HEIGHT + _OW + _MARGIN)
-ax.set_aspect('equal')
-ax.set_xlabel('X (m)')
-ax.set_ylabel('Y (m)')
-ax.grid(True, alpha=0.25, zorder=0)
-
-# ── Static background ─────────────────────────────────────────────────────────
-_gx_min = (FIELD_WIDTH - GOAL_WIDTH) / 2
-_gx_max = (FIELD_WIDTH + GOAL_WIDTH) / 2
-
-ax.add_patch(patches.Rectangle(
-    (-_OW, -_OW), FIELD_WIDTH + 2 * _OW, FIELD_HEIGHT + 2 * _OW,
-    linewidth=2, edgecolor='#222222', facecolor='#cccccc', zorder=1))
-
-ax.add_patch(patches.Rectangle(
-    (0, 0), FIELD_WIDTH, FIELD_HEIGHT,
-    linewidth=1, edgecolor='white', facecolor='#c8e6c9', zorder=2))
-
-ax.add_patch(patches.Rectangle(
-    (_gx_min, -_OW), GOAL_WIDTH, _OW,
-    linewidth=0, facecolor='#ffee44', zorder=3))
-
-ax.add_patch(patches.Rectangle(
-    (_gx_min, FIELD_HEIGHT), GOAL_WIDTH, _OW,
-    linewidth=0, facecolor='#4488ff', zorder=3))
-
-for _gx in (_gx_min, _gx_max):
-    ax.add_line(plt.Line2D([_gx, _gx], [-_OW, 0.0],
-                           color='#222222', lw=2, zorder=4))
-    ax.add_line(plt.Line2D([_gx, _gx], [FIELD_HEIGHT, FIELD_HEIGHT + _OW],
-                           color='#222222', lw=2, zorder=4))
-
-# ── Pre-allocated dynamic artists ─────────────────────────────────────────────
-# (No animated=True — Agg renders everything in fig.canvas.draw())
-
-_TAB10 = [tuple(plt.cm.tab10(i)[:3]) for i in range(10)]
-
-_art_lidar = ax.scatter([], [], s=5, c='#222222', zorder=10)
-
-_art_self = patches.Circle((0, 0), ROBOT_RADIUS,
-    lw=1.5, edgecolor='#2a7a2a', facecolor='#aaddaa',
-    zorder=7, visible=False)
-ax.add_patch(_art_self)
-
-_art_bots  = []
-_art_blbls = []
-for _ in range(_MAX_VIS_ROBOTS):
-    c = patches.Circle((0, 0), ROBOT_RADIUS,
-        lw=1.5, edgecolor='gray', facecolor='lightgray',
-        zorder=7, visible=False)
-    ax.add_patch(c)
-    t = ax.text(0, 0, '', ha='center', va='bottom', fontsize=8,
-        fontweight='bold', visible=False, zorder=8)
-    _art_bots.append(c)
-    _art_blbls.append(t)
-
-_art_arrow = FancyArrowPatch((0, 0), (0.1, 0),
-    arrowstyle='->', color='#2a7a2a', lw=2.0, mutation_scale=15,
-    zorder=8, visible=False)
-ax.add_patch(_art_arrow)
-
-_WSPAN_X = (-_OW - _MARGIN, FIELD_WIDTH  + _OW + _MARGIN)
-_WSPAN_Y = (-_OW - _MARGIN, FIELD_HEIGHT + _OW + _MARGIN)
-
-def _wall_line(color, ls):
-    (ln,) = ax.plot([], [], color=color, lw=1.5, ls=ls,
-        zorder=4, visible=False)
-    return ln
-
-_art_walls = [_wall_line('steelblue', '--') for _ in range(_MAX_WALLS)]
-
-_art_pos_hist = ax.scatter([], [], s=18, zorder=5, edgecolors='none')
-_art_bot_hist = ax.scatter([], [], s=18, zorder=5, edgecolors='none')
-
-_BALL_RADIUS = 0.021
-_art_ball = patches.Circle((0, 0), _BALL_RADIUS,
-    lw=1.5, edgecolor='darkorange', facecolor='orange',
-    zorder=9, visible=False)
-ax.add_patch(_art_ball)
-
-_art_ball_hist = ax.scatter([], [], s=14, zorder=5, edgecolors='none')
-
-_art_ball_arrow = FancyArrowPatch((0, 0), (0.1, 0),
-    arrowstyle='->', color='darkorange', lw=1.5, mutation_scale=10,
-    zorder=9, visible=False)
-ax.add_patch(_art_ball_arrow)
-
-_art_ball_hidden = patches.Circle((0, 0), _BALL_RADIUS,
-    lw=1.5, edgecolor='darkorange', facecolor=(1.0, 0.55, 0.0, 0.25), ls='--',
-    zorder=8, visible=False)
-ax.add_patch(_art_ball_hidden)
-
-def _sim_cross(color):
-    (art,) = ax.plot([], [], marker='+', markersize=12, markeredgewidth=2,
-                     color=color, ls='none', zorder=8)
-    return art
-
-_art_sim_ball = _sim_cross('darkorange')
-_art_sim_self = _sim_cross('#2a7a2a')
-_art_sim_obs  = [_sim_cross((0.90, 0.22, 0.18)) for _ in range(3)]
-
-_ALLY_BLUE = (0.13, 0.53, 0.90)
-_MAX_ALLY_OTHERS = 3
-
-def _ally_marker(marker):
-    (art,) = ax.plot([], [], marker=marker, markersize=10, markeredgewidth=2,
-                     color=_ALLY_BLUE, ls='none', zorder=9)
-    return art
-
-_art_ally_main = _ally_marker('D')
-_art_ally_det  = [_ally_marker('x') for _ in range(_MAX_ALLY_OTHERS)]
-_art_ally_ball = _ally_marker('*')
-
-_art_status = ax.text(0.01, 0.99, '', transform=ax.transAxes,
-    ha='left', va='top', fontsize=8, zorder=15,
-    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-              alpha=0.75, edgecolor='none'))
-
-_art_game_state = ax.text(1.02, 0.055, '', transform=ax.transAxes,
-    ha='left', va='top', fontsize=12, zorder=15, clip_on=False,
-    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-              alpha=0.75, edgecolor='gray'))
-
-# ── Legend ────────────────────────────────────────────────────────────────────
-_legend_handles = [
-    Line2D([0], [0], marker='o', color='w', markerfacecolor='#aaddaa',
-           markeredgecolor='#2a7a2a', markersize=8, label='Own robot'),
-    Line2D([0], [0], color='#2a7a2a', lw=2, label='Heading'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor='#aaddaa',
-           markeredgecolor=None, markersize=3, label='Own history'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor=_ALLY_BLUE,
-           markeredgecolor=_ALLY_BLUE, markersize=8, label='Ally robot'),
-    Line2D([0], [0], marker='d', color='w', markerfacecolor=_ALLY_BLUE,
-           markeredgecolor=_ALLY_BLUE, markersize=4, label='Ally position'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor=_ALLY_BLUE,
-           markeredgecolor=None, markersize=3, label='Ally history'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
-           markeredgecolor='darkred', markersize=8, label='Enemy robot'),
-    Line2D([0], [0], marker='+', color='red', linestyle='None',
-           markersize=4, label='Own detections'),
-    Line2D([0], [0], marker='x', color=_ALLY_BLUE, linestyle='None',
-           markersize=4, label='Ally detections'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
-           markeredgecolor=None, markersize=3, label='Enemy history'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor='orange',
-           markeredgecolor='darkorange', markersize=4, label='Ball'),
-    Line2D([0], [0], color='orange', lw=1, label='Ball velocity'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor=(1.0, 0.55, 0.0, 0.25),
-           markeredgecolor='darkorange', linestyle='--', markersize=4,
-           label='Ball (extrapolated prediction)'),
-    Line2D([0], [0], marker='+', color='darkorange', linestyle='None',
-           markersize=4, label='Own ball detection)'),
-    Line2D([0], [0], marker='*', color=_ALLY_BLUE, linestyle='None',
-           markersize=4, label='Ally ball detection)'),
-    Line2D([0], [0], marker='o', color='w', markerfacecolor='darkorange',
-           markeredgecolor=None, markersize=3, label='Ball history'),
-    Line2D([0], [0], color='steelblue', lw=1.5, linestyle='--',
-           label='Walls'),
-    Line2D([0], [0], marker='.', color='black', linestyle='None',
-           markersize=4, label='Lidar'),
-]
-
-ax.legend(handles=_legend_handles,
-          loc='upper left',
-          bbox_to_anchor=(1.02, 1.0),
-          borderaxespad=0.)
-
-# ── Frame buffer ──────────────────────────────────────────────────────────────
-_frame_lock  = threading.Lock()
-_frame_bytes = b""
-_render_lock = threading.Lock()   # serialises fig.canvas.draw() calls
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _update_wall_lines(walls, art_list, origin):
-    for i, line in enumerate(art_list):
-        if i < len(walls):
-            off = walls[i]["offset"]
-            if walls[i]["gradient"] == 0:
-                y = origin[1] + off
-                line.set_xdata([*_WSPAN_X])
-                line.set_ydata([y, y])
-            else:
-                x = origin[0] + off
-                line.set_xdata([x, x])
-                line.set_ydata([*_WSPAN_Y])
-            line.set_visible(True)
-        else:
-            line.set_visible(False)
-
-
-# ── Redraw (mirrors node_dev_twin_vis._redraw exactly) ────────────────────────
-
-def _redraw():
-    fa        = _heading()
-    fa_rad    = math.radians(fa)
-    known_pos = _robot_pos is not None
-    origin    = _robot_pos if known_pos else (0.0, 0.0)
-
-    # ── Lidar ─────────────────────────────────────────────────────────────────
-    if _lidar:
-        lo    = _detection_origin if _detection_origin is not None else origin
-        lh    = _detection_heading if _detection_heading is not None else fa_rad
-        angs  = np.radians(list(_lidar.keys())) + lh
-        dists = np.array(list(_lidar.values())) / 1000.0
-        _art_lidar.set_offsets(np.column_stack((
-            lo[0] + dists * np.cos(angs),
-            lo[1] + dists * np.sin(angs),
-        )))
-    else:
-        _art_lidar.set_offsets(np.empty((0, 2)))
-
-    # ── Own robot ─────────────────────────────────────────────────────────────
-    _art_self.set_visible(known_pos)
-    if known_pos:
-        _art_self.set_center(origin)
-
-    # ── Other robots ──────────────────────────────────────────────────────────
-    for i in range(_MAX_VIS_ROBOTS):
-        circ = _art_bots[i]
-        lbl  = _art_blbls[i]
-        if known_pos and i < len(_other_robots):
-            r         = _other_robots[i]
-            ox, oy    = r[0], r[1]
-            method    = str(r[2]) if len(r) > 2 else ""
-            rid       = int(r[3]) if len(r) > 3 else 0
-            is_ally   = _ally_id is not None and rid == _ally_id
-            predicted = method == "predicted"
-            c_solid   = _ALLY_BLUE if is_ally else (0.90, 0.22, 0.18)
-            c_face    = c_solid + (0.15 if predicted else 0.3,)
-            circ.set_center((ox, oy))
-            circ.set_edgecolor(c_solid)
-            circ.set_facecolor(c_face)
-            circ.set_linestyle('--' if predicted else '-')
-            circ.set_visible(True)
-            lbl.set_position((ox, oy + ROBOT_RADIUS + 0.03))
-            lbl.set_text(f"#{rid}")
-            lbl.set_color(c_solid)
-            lbl.set_alpha(0.5 if predicted else 1.0)
-            lbl.set_visible(True)
-        else:
-            circ.set_visible(False)
-            lbl.set_visible(False)
-
-    # ── Heading arrow ─────────────────────────────────────────────────────────
-    arrow_len = ROBOT_RADIUS * 1.8
-    _art_arrow.set_positions(
-        origin,
-        (origin[0] + arrow_len * math.cos(fa_rad),
-         origin[1] + arrow_len * math.sin(fa_rad)),
-    )
-    _art_arrow.set_visible(True)
-
-    # ── Ball ──────────────────────────────────────────────────────────────────
-    if _ball_pos is not None:
-        _art_ball.set_center((_ball_pos["x"], _ball_pos["y"]))
-        _art_ball.set_visible(True)
-        _art_ball_hidden.set_visible(False)
-    elif _ball_hidden_pos is not None:
-        _art_ball.set_visible(False)
-        _art_ball_hidden.set_center((_ball_hidden_pos["x"], _ball_hidden_pos["y"]))
-        _art_ball_hidden.set_edgecolor('red' if _ball_lost else 'darkorange')
-        _art_ball_hidden.set_facecolor((1.0, 0.0, 0.0, 0.25) if _ball_lost
-                                       else (1.0, 0.55, 0.0, 0.25))
-        _art_ball_hidden.set_visible(True)
-    else:
-        _art_ball.set_visible(False)
-        _art_ball_hidden.set_visible(False)
-
-    # ── Ball history trail ────────────────────────────────────────────────────
-    if len(_ball_history) > 1:
-        arr   = np.array([(p["x"], p["y"], p["t"]) for p in _ball_history])
-        t0    = arr[0, 2];  rng = max(arr[-1, 2] - t0, 1e-9)
-        alpha = 0.05 + 0.7 * (arr[:, 2] - t0) / rng
-        rgba  = np.column_stack([np.full((len(arr), 3), [1.0, 0.55, 0.0]), alpha])
-        _art_ball_hist.set_offsets(arr[:, :2])
-        _art_ball_hist.set_facecolors(rgba)
-    else:
-        _art_ball_hist.set_offsets(np.empty((0, 2)))
-
-    # ── Ball velocity arrow ───────────────────────────────────────────────────
-    _arrow_origin = _ball_pos or _ball_hidden_pos
-    if (_arrow_origin is not None and _ball_vx is not None and _ball_vy is not None
-            and math.hypot(_ball_vx, _ball_vy) > 0.1):
-        bx, by = _arrow_origin["x"], _arrow_origin["y"]
-        _art_ball_arrow.set_positions(
-            (bx, by),
-            (bx + _ball_vx * 0.5, by + _ball_vy * 0.5),
-        )
-        _art_ball_arrow.set_visible(True)
-    else:
-        _art_ball_arrow.set_visible(False)
-
-    # ── Raw detection crosses ─────────────────────────────────────────────────
-    if _ball_raw is not None and _ball_raw["global_pos"] is not None:
-        _art_sim_ball.set_data([_ball_raw["global_pos"]["x"]], [_ball_raw["global_pos"]["y"]])
-    else:
-        _art_sim_ball.set_data([], [])
-
-    if _raw_robots is not None:
-        for i, art in enumerate(_art_sim_obs):
-            if i < len(_raw_robots):
-                robot = _raw_robots[i]
-                art.set_data([robot["x"]], [robot["y"]])
-            else:
-                art.set_data([], [])
-    else:
-        for art in _art_sim_obs:
-            art.set_data([], [])
-
-    # ── Ally detected positions ───────────────────────────────────────────────
-    p = _ally_pos_raw.get("ally_main_robot_pos")
-    _art_ally_main.set_data([p["x"]], [p["y"]]) if p else _art_ally_main.set_data([], [])
-    for i, art in enumerate(_art_ally_det):
-        p = _ally_pos_raw.get(f"ally_other_pos_{i + 1}")
-        art.set_data([p["x"]], [p["y"]]) if p else art.set_data([], [])
-    p = _ally_pos_raw.get("ally_ball_pos")
-    _art_ally_ball.set_data([p["x"]], [p["y"]]) if p else _art_ally_ball.set_data([], [])
-
-    # ── Walls ─────────────────────────────────────────────────────────────────
-    _update_wall_lines(_walls, _art_walls, origin)
-
-    # ── Position history ──────────────────────────────────────────────────────
-    if known_pos and len(_position_history) > 1:
-        arr   = np.array([(p["x"], p["y"], p["t"]) for p in _position_history])
-        t0    = arr[0, 2];  rng = max(arr[-1, 2] - t0, 1e-9)
-        alpha = 0.05 + 0.7 * (arr[:, 2] - t0) / rng
-        rgba  = np.column_stack([np.full((len(arr), 3), [0.17, 0.48, 0.17]), alpha])
-        _art_pos_hist.set_offsets(arr[:, :2])
-        _art_pos_hist.set_facecolors(rgba)
-    else:
-        _art_pos_hist.set_offsets(np.empty((0, 2)))
-
-    # ── Robot history ─────────────────────────────────────────────────────────
-    if known_pos and _other_robots_history:
-        t0   = _other_robots_history[0]["t"]
-        rng  = max(_other_robots_history[-1]["t"] - t0, 1e-9)
-        pts, rgba = [], []
-        for snap in _other_robots_history:
-            alpha = 0.05 + 0.6 * (snap["t"] - t0) / rng
-            for r in snap["robots"]:
-                rid = int(r.get("id", 0))
-                c   = _ALLY_BLUE if (_ally_id is not None and rid == _ally_id) else (0.90, 0.22, 0.18)
-                pts.append((r["x"], r["y"]))
-                rgba.append(c + (alpha,))
-        if pts:
-            _art_bot_hist.set_offsets(np.array(pts))
-            _art_bot_hist.set_facecolors(rgba)
-        else:
-            _art_bot_hist.set_offsets(np.empty((0, 2)))
-    else:
-        _art_bot_hist.set_offsets(np.empty((0, 2)))
-
-    # ── Status text ───────────────────────────────────────────────────────────
-    pos_str = f"({origin[0]:.2f}, {origin[1]:.2f})" if known_pos else "unknown"
-    _art_status.set_text(
-        f"pos={pos_str}  heading={fa:.1f}°\n"
-        f"walls={len(_walls)}  bots={len(_other_robots)}"
-    )
-
-    # ── Game state text ───────────────────────────────────────────────────────
-    if _field_sectors is not None:
-        gs   = _field_sectors.get("game_state") or {}
-        ctrl = _field_sectors.get("ball_control")
-
-        state_str    = gs.get("state")    or "—"
-        strength_str = gs.get("strength") or ""
-        team_val     = gs.get("team")
-        side_str     = gs.get("side")     or "—"
-        substate_str = gs.get("substate") or "—"
-        team_str     = f"T{team_val}" if team_val is not None else "—"
-
-        ctrl_str = "none"
-        if ctrl is not None:
-            cid   = ctrl.get("id")
-            cteam = ctrl.get("team", "?")
-            ctrl_str = f"self (T{cteam})" if cid is None else f"#{cid} (T{cteam})"
-
-        _art_game_state.set_text(
-            f"{strength_str} {state_str}  {team_str}  ·  {side_str}  ·  {substate_str}\n"
-            f"ctrl: {ctrl_str}"
-        )
-    else:
-        _art_game_state.set_text("game state: —")
-
-    # ── Render to PNG ─────────────────────────────────────────────────────────
-    fig.canvas.draw()
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png')
-    buf.seek(0)
-    return buf.getvalue()
-
-
-# ── Render loop ───────────────────────────────────────────────────────────────
-
-def _render_loop():
-    global _frame_bytes
-    interval = 1.0 / RENDER_HZ
-    while True:
-        t0 = time.monotonic()
-        try:
-            with _render_lock:
-                with _state_lock:
-                    png = _redraw()
-            with _frame_lock:
-                _frame_bytes = png
-        except Exception as e:
-            print(f"[WEB-VIS] render error: {e}")
-        elapsed = time.monotonic() - t0
-        time.sleep(max(0.0, interval - elapsed))
-
-
-# ── HTTP server ───────────────────────────────────────────────────────────────
-
-_HTML = """\
-<!DOCTYPE html>
-<html>
+# ── SSE push ──────────────────────────────────────────────────────────────────
+_push_cond = threading.Condition()
+_push_seq  = 0
+
+def _notify():
+    global _push_seq
+    with _push_cond:
+        _push_seq += 1
+        _push_cond.notify_all()
+
+def _build_state():
+    """Snapshot current state as a JSON string (called under _state_lock)."""
+    return json.dumps({
+        "robot_pos":            list(_robot_pos) if _robot_pos else None,
+        "heading":              _imu_pitch,
+        "detection_origin":     list(_detection_origin) if _detection_origin else None,
+        "detection_heading":    _detection_heading,
+        "other_robots":         _other_robots,
+        "ally_id":              _ally_id,
+        "lidar":                _lidar,
+        "walls":                _walls,
+        "ball_pos":             _ball_pos,
+        "ball_hidden_pos":      _ball_hidden_pos,
+        "ball_lost":            _ball_lost,
+        "ball_vx":              _ball_vx,
+        "ball_vy":              _ball_vy,
+        "ball_history":         _ball_history,
+        "position_history":     _position_history,
+        "other_robots_history": _other_robots_history,
+        "raw_robots":           _raw_robots,
+        "ball_raw":             _ball_raw,
+        "field_sectors":        _field_sectors,
+        "ally_pos_raw":         _ally_pos_raw,
+    })
+
+# ── HTML page (served once; all rendering is client-side) ─────────────────────
+_HTML = r"""<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Field Visualisation</title>
-  <style>
-    body { margin: 0; background: #111; display: flex;
-           flex-direction: column; align-items: center; }
-    img  { max-width: 100vw; max-height: 100vh; object-fit: contain; }
-    #fps { color: #888; font: 11px monospace; margin: 4px; }
-  </style>
+<meta charset="utf-8">
+<title>Field Vis</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #111; display: flex; align-items: flex-start;
+       gap: 10px; padding: 8px; font-family: monospace; overflow: hidden; }
+#canvas-col { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+canvas { display: block; background: white; }
+#fps { color: #666; font-size: 11px; }
+#side { display: flex; flex-direction: column; gap: 8px; min-width: 175px; max-width: 200px; }
+#gs { background: #f5f5f5; border: 1px solid #aaa; border-radius: 4px;
+      padding: 6px 8px; color: #222; font-size: 12px; white-space: pre-line; line-height: 1.5; }
+#legend { background: #f5f5f5; border: 1px solid #aaa; border-radius: 4px;
+          padding: 6px 8px; color: #222; font-size: 11px; }
+#legend h4 { font-size: 11px; color: #555; margin-bottom: 4px; }
+.li { display: flex; align-items: center; gap: 5px; margin: 2px 0; line-height: 1.3; }
+.sw { flex-shrink: 0; }
+</style>
 </head>
 <body>
+<div id="canvas-col">
+  <canvas id="c"></canvas>
   <div id="fps">connecting…</div>
-  <img id="frame" src="/frame.png" alt="field">
-  <script>
-    const img    = document.getElementById('frame');
-    const fps_el = document.getElementById('fps');
-    let last = performance.now(), frames = 0;
+</div>
+<div id="side">
+  <div id="gs">game state: —</div>
+  <div id="legend">
+    <h4>Legend</h4>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="6" fill="#aaddaa" stroke="#2a7a2a" stroke-width="1.5"/></svg>Own robot</div>
+    <div class="li"><svg class="sw" width="22" height="14"><line x1="2" y1="7" x2="18" y2="7" stroke="#2a7a2a" stroke-width="2"/><polygon points="18,4 22,7 18,10" fill="#2a7a2a"/></svg>Heading</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="3" fill="#aaddaa"/></svg>Own history</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="6" fill="rgba(33,135,230,0.3)" stroke="rgb(33,135,230)" stroke-width="1.5"/></svg>Ally robot</div>
+    <div class="li"><svg class="sw" width="22" height="14"><polygon points="11,2 18,7 11,12 4,7" fill="none" stroke="rgb(33,135,230)" stroke-width="2"/></svg>Ally position</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="3" fill="rgb(33,135,230)"/></svg>Ally history</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="6" fill="rgba(230,56,46,0.3)" stroke="rgb(230,56,46)" stroke-width="1.5"/></svg>Enemy robot</div>
+    <div class="li"><svg class="sw" width="22" height="14"><line x1="11" y1="2" x2="11" y2="12" stroke="red" stroke-width="2"/><line x1="6" y1="7" x2="16" y2="7" stroke="red" stroke-width="2"/></svg>Own detections</div>
+    <div class="li"><svg class="sw" width="22" height="14"><line x1="4" y1="4" x2="18" y2="10" stroke="rgb(33,135,230)" stroke-width="2"/><line x1="18" y1="4" x2="4" y2="10" stroke="rgb(33,135,230)" stroke-width="2"/></svg>Ally detections</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="3" fill="rgb(230,56,46)"/></svg>Enemy history</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="5" fill="orange" stroke="darkorange" stroke-width="1.5"/></svg>Ball</div>
+    <div class="li"><svg class="sw" width="22" height="14"><line x1="2" y1="7" x2="17" y2="7" stroke="darkorange" stroke-width="1.5"/><polygon points="17,4 22,7 17,10" fill="darkorange"/></svg>Ball velocity</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="5" fill="rgba(255,140,0,0.25)" stroke="darkorange" stroke-width="1.5" stroke-dasharray="3,2"/></svg>Ball (extrapolated)</div>
+    <div class="li"><svg class="sw" width="22" height="14"><line x1="11" y1="2" x2="11" y2="12" stroke="darkorange" stroke-width="2"/><line x1="6" y1="7" x2="16" y2="7" stroke="darkorange" stroke-width="2"/></svg>Own ball det.</div>
+    <div class="li"><svg class="sw" width="22" height="14"><text x="11" y="11" text-anchor="middle" fill="rgb(33,135,230)" font-size="14">★</text></svg>Ally ball det.</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="3" fill="darkorange"/></svg>Ball history</div>
+    <div class="li"><svg class="sw" width="22" height="14"><line x1="2" y1="7" x2="20" y2="7" stroke="steelblue" stroke-width="1.5" stroke-dasharray="4,3"/></svg>Walls</div>
+    <div class="li"><svg class="sw" width="22" height="14"><circle cx="11" cy="7" r="2.5" fill="#222"/></svg>Lidar</div>
+  </div>
+</div>
 
-    function refresh() {
-      const next = new Image();
-      next.onload = () => {
-        img.src = next.src;
-        frames++;
-        const now = performance.now();
-        if (now - last >= 1000) {
-          fps_el.textContent = frames + ' fps';
-          frames = 0;
-          last = now;
-        }
-        setTimeout(refresh, INTERVAL_MS);
-      };
-      next.onerror = () => setTimeout(refresh, 500);
-      next.src = '/frame.png?t=' + Date.now();
+<script>
+(function () {
+'use strict';
+
+// ── Field constants (must match Python nodes) ─────────────────────────────────
+const FW = 1.58, FH = 2.19, OW = 0.12, MAR = 0.10;
+const GW = 0.60, RR = 0.09, BR = 0.021;
+const GX1 = (FW - GW) / 2, GX2 = (FW + GW) / 2;
+const XMIN = -OW - MAR, XMAX = FW + OW + MAR;
+const YMIN = -OW - MAR, YMAX = FH + OW + MAR;
+const VWID = XMAX - XMIN, VHGT = YMAX - YMIN;
+const ALLY_RGB  = '33,135,230';
+const ENEMY_RGB = '230,56,46';
+const OWN_EDGE  = '#2a7a2a';
+const OWN_FACE  = '#aaddaa';
+
+// ── Canvas setup ──────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W = 1, H = 1, SF = 1;
+
+function resize() {
+    const maxH = window.innerHeight - 32;
+    H = maxH;
+    W = Math.round(H * VWID / VHGT);
+    canvas.width  = W;
+    canvas.height = H;
+    SF = W / VWID;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Coordinate helpers ────────────────────────────────────────────────────────
+function cx(x)    { return (x - XMIN) * SF; }
+function cy(y)    { return H - (y - YMIN) * SF; }
+function sc(m)    { return m * SF; }
+
+// Rectangle from field bottom-left to top-right
+function frect(x1, y1, x2, y2) {
+    return [cx(x1), cy(y2), sc(x2 - x1), sc(y2 - y1)];
+}
+
+// ── Draw helpers ──────────────────────────────────────────────────────────────
+function arrow(x1, y1, x2, y2, color, lw) {
+    const [ax1, ay1] = [cx(x1), cy(y1)];
+    const [ax2, ay2] = [cx(x2), cy(y2)];
+    const dx = ax2 - ax1, dy = ay2 - ay1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return;
+    const nx = dx / len, ny = dy / len;
+    const hs = Math.max(sc(0.028), 5);
+    ctx.beginPath();
+    ctx.moveTo(ax1, ay1);
+    ctx.lineTo(ax2 - nx * hs * 0.7, ay2 - ny * hs * 0.7);
+    ctx.strokeStyle = color; ctx.lineWidth = lw || 2; ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ax2, ay2);
+    ctx.lineTo(ax2 - nx*hs - ny*hs*0.4, ay2 - ny*hs + nx*hs*0.4);
+    ctx.lineTo(ax2 - nx*hs + ny*hs*0.4, ay2 - ny*hs - nx*hs*0.4);
+    ctx.closePath();
+    ctx.fillStyle = color; ctx.fill();
+}
+
+function cross(x, y, size, color, lw) {
+    const [pcx, pcy] = [cx(x), cy(y)];
+    const s = sc(size);
+    ctx.strokeStyle = color; ctx.lineWidth = lw || 2;
+    ctx.beginPath();
+    ctx.moveTo(pcx - s, pcy); ctx.lineTo(pcx + s, pcy);
+    ctx.moveTo(pcx, pcy - s); ctx.lineTo(pcx, pcy + s);
+    ctx.stroke();
+}
+
+function xcross(x, y, size, color, lw) {
+    const [pcx, pcy] = [cx(x), cy(y)];
+    const s = sc(size);
+    ctx.strokeStyle = color; ctx.lineWidth = lw || 2;
+    ctx.beginPath();
+    ctx.moveTo(pcx - s, pcy - s); ctx.lineTo(pcx + s, pcy + s);
+    ctx.moveTo(pcx + s, pcy - s); ctx.lineTo(pcx - s, pcy + s);
+    ctx.stroke();
+}
+
+function diamond(x, y, size, color, lw) {
+    const [pcx, pcy] = [cx(x), cy(y)];
+    const s = sc(size);
+    ctx.strokeStyle = color; ctx.lineWidth = lw || 2;
+    ctx.beginPath();
+    ctx.moveTo(pcx, pcy - s);
+    ctx.lineTo(pcx + s * 0.65, pcy);
+    ctx.lineTo(pcx, pcy + s);
+    ctx.lineTo(pcx - s * 0.65, pcy);
+    ctx.closePath();
+    ctx.stroke();
+}
+
+function star(x, y, size, color) {
+    const [pcx, pcy] = [cx(x), cy(y)];
+    ctx.font = `${sc(size * 2.5)}px sans-serif`;
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('★', pcx, pcy);
+}
+
+function dot(x, y, r, fill) {
+    ctx.beginPath();
+    ctx.arc(cx(x), cy(y), r, 0, Math.PI * 2);
+    ctx.fillStyle = fill; ctx.fill();
+}
+
+// ── Static field ──────────────────────────────────────────────────────────────
+function drawField() {
+    // Grid
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 0.5; ctx.setLineDash([]);
+    for (let gx = -0.5; gx <= FW + OW + MAR; gx += 0.5) {
+        ctx.beginPath(); ctx.moveTo(cx(gx), 0); ctx.lineTo(cx(gx), H); ctx.stroke();
     }
-    refresh();
-  </script>
-</body>
-</html>
-""".replace("INTERVAL_MS", str(int(1000 / RENDER_HZ)))
+    for (let gy = -0.5; gy <= FH + OW + MAR; gy += 0.5) {
+        ctx.beginPath(); ctx.moveTo(0, cy(gy)); ctx.lineTo(W, cy(gy)); ctx.stroke();
+    }
 
+    // Outer wall area
+    ctx.fillStyle = '#cccccc'; ctx.strokeStyle = '#222'; ctx.lineWidth = 2; ctx.setLineDash([]);
+    ctx.fillRect(...frect(-OW, -OW, FW + OW, FH + OW));
+    ctx.strokeRect(...frect(-OW, -OW, FW + OW, FH + OW));
+
+    // Playing field
+    ctx.fillStyle = '#c8e6c9'; ctx.strokeStyle = 'white'; ctx.lineWidth = 1;
+    ctx.fillRect(...frect(0, 0, FW, FH));
+    ctx.strokeRect(...frect(0, 0, FW, FH));
+
+    // Bottom goal (yellow)
+    ctx.fillStyle = '#ffee44'; ctx.fillRect(...frect(GX1, -OW, GX2, 0));
+    // Top goal (blue)
+    ctx.fillStyle = '#4488ff'; ctx.fillRect(...frect(GX1, FH, GX2, FH + OW));
+
+    // Goal side walls
+    ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+    for (const gx of [GX1, GX2]) {
+        ctx.beginPath(); ctx.moveTo(cx(gx), cy(-OW));  ctx.lineTo(cx(gx), cy(0));       ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(cx(gx), cy(FH));   ctx.lineTo(cx(gx), cy(FH + OW)); ctx.stroke();
+    }
+}
+
+// ── Walls ─────────────────────────────────────────────────────────────────────
+function drawWalls(s) {
+    if (!s.walls || !s.walls.length || !s.robot_pos) return;
+    const [ox, oy] = s.robot_pos;
+    ctx.strokeStyle = 'steelblue'; ctx.lineWidth = 1.5; ctx.setLineDash([8, 4]);
+    for (const w of s.walls) {
+        if (w.gradient === 0) {
+            const wy = oy + w.offset;
+            ctx.beginPath(); ctx.moveTo(0, cy(wy)); ctx.lineTo(W, cy(wy)); ctx.stroke();
+        } else {
+            const wx = ox + w.offset;
+            ctx.beginPath(); ctx.moveTo(cx(wx), 0); ctx.lineTo(cx(wx), H); ctx.stroke();
+        }
+    }
+    ctx.setLineDash([]);
+}
+
+// ── Lidar ─────────────────────────────────────────────────────────────────────
+function drawLidar(s) {
+    if (!s.lidar) return;
+    const origin = s.detection_origin || s.robot_pos;
+    if (!origin) return;
+    const lh = s.detection_heading != null ? s.detection_heading
+             : ((s.heading || 0) * Math.PI / 180);
+    ctx.fillStyle = '#222222';
+    ctx.beginPath();
+    for (const [angStr, distMm] of Object.entries(s.lidar)) {
+        const a = parseFloat(angStr) * Math.PI / 180 + lh;
+        const d = distMm / 1000;
+        const pcx = cx(origin[0] + d * Math.cos(a));
+        const pcy = cy(origin[1] + d * Math.sin(a));
+        ctx.moveTo(pcx + 2.5, pcy);
+        ctx.arc(pcx, pcy, 2.5, 0, Math.PI * 2);
+    }
+    ctx.fill();
+}
+
+// ── History trails ────────────────────────────────────────────────────────────
+function drawTrail(pts, r, rgbStr, alphaScale) {
+    if (!pts || pts.length < 2) return;
+    const t0 = pts[0].t, tMax = pts[pts.length - 1].t;
+    const rng = Math.max(tMax - t0, 1e-9);
+    for (const p of pts) {
+        const a = 0.05 + (alphaScale || 0.7) * (p.t - t0) / rng;
+        dot(p.x, p.y, r, `rgba(${rgbStr},${a})`);
+    }
+}
+
+function drawRobotHistory(s) {
+    if (!s.other_robots_history || !s.other_robots_history.length) return;
+    const snaps = s.other_robots_history;
+    const t0 = snaps[0].t, tMax = snaps[snaps.length - 1].t;
+    const rng = Math.max(tMax - t0, 1e-9);
+    for (const snap of snaps) {
+        const a = 0.05 + 0.6 * (snap.t - t0) / rng;
+        for (const r of snap.robots) {
+            const isAlly = s.ally_id != null && parseInt(r.id) === s.ally_id;
+            dot(r.x, r.y, sc(0.018), `rgba(${isAlly ? ALLY_RGB : ENEMY_RGB},${a})`);
+        }
+    }
+}
+
+// ── Robots ────────────────────────────────────────────────────────────────────
+function drawRobot(x, y, face, edge, dashed, alpha) {
+    const [pcx, pcy] = [cx(x), cy(y)];
+    const r = sc(RR);
+    ctx.globalAlpha = alpha != null ? alpha : 1;
+    ctx.beginPath(); ctx.arc(pcx, pcy, r, 0, Math.PI * 2);
+    if (dashed) ctx.setLineDash([sc(0.02), sc(0.02)]);
+    ctx.fillStyle = face; ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+}
+
+function drawOtherRobots(s) {
+    if (!s.other_robots) return;
+    for (const r of s.other_robots) {
+        const [rx, ry, method, id, ] = r;
+        const rid     = parseInt(id);
+        const isAlly  = s.ally_id != null && rid === s.ally_id;
+        const pred    = method === 'predicted';
+        const rgb     = isAlly ? ALLY_RGB : ENEMY_RGB;
+        const faceA   = pred ? 0.15 : 0.3;
+        drawRobot(rx, ry, `rgba(${rgb},${faceA})`, `rgb(${rgb})`, pred, pred ? 0.6 : 1.0);
+        // Label
+        ctx.globalAlpha = pred ? 0.5 : 1;
+        ctx.fillStyle = `rgb(${rgb})`;
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+        ctx.fillText(`#${rid}`, cx(rx), cy(ry + RR + 0.03));
+        ctx.globalAlpha = 1;
+    }
+}
+
+function drawOwnRobot(s) {
+    if (!s.robot_pos) return;
+    const [rx, ry] = s.robot_pos;
+    drawRobot(rx, ry, OWN_FACE, OWN_EDGE);
+    // Heading arrow
+    const hr = ((s.heading || 0) * Math.PI / 180);
+    const alen = RR * 1.8;
+    arrow(rx, ry, rx + alen * Math.cos(hr), ry + alen * Math.sin(hr), OWN_EDGE, 2);
+}
+
+// ── Ball ──────────────────────────────────────────────────────────────────────
+function drawBall(s) {
+    // Hidden / extrapolated
+    if (!s.ball_pos && s.ball_hidden_pos) {
+        const {x, y} = s.ball_hidden_pos;
+        const [pcx, pcy] = [cx(x), cy(y)];
+        const r = sc(BR);
+        ctx.beginPath(); ctx.arc(pcx, pcy, r, 0, Math.PI * 2);
+        ctx.setLineDash([sc(0.015), sc(0.01)]);
+        ctx.fillStyle  = s.ball_lost ? 'rgba(255,0,0,0.25)' : 'rgba(255,140,0,0.25)';
+        ctx.strokeStyle = s.ball_lost ? 'red' : 'darkorange'; ctx.lineWidth = 1.5;
+        ctx.fill(); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    // Detected position
+    if (s.ball_pos) {
+        const {x, y} = s.ball_pos;
+        const [pcx, pcy] = [cx(x), cy(y)];
+        ctx.beginPath(); ctx.arc(pcx, pcy, sc(BR), 0, Math.PI * 2);
+        ctx.fillStyle = 'orange'; ctx.fill();
+        ctx.strokeStyle = 'darkorange'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+
+    // Velocity arrow
+    const orig = s.ball_pos || s.ball_hidden_pos;
+    if (orig && s.ball_vx != null && s.ball_vy != null
+            && Math.hypot(s.ball_vx, s.ball_vy) > 0.1) {
+        arrow(orig.x, orig.y,
+              orig.x + s.ball_vx * 0.5, orig.y + s.ball_vy * 0.5,
+              'darkorange', 1.5);
+    }
+}
+
+// ── Raw detections ────────────────────────────────────────────────────────────
+function drawRawDetections(s) {
+    if (s.ball_raw && s.ball_raw.global_pos) {
+        cross(s.ball_raw.global_pos.x, s.ball_raw.global_pos.y, 0.03, 'darkorange', 2);
+    }
+    if (s.raw_robots) {
+        for (const r of s.raw_robots) cross(r.x, r.y, 0.03, 'red', 2);
+    }
+}
+
+// ── Ally markers ──────────────────────────────────────────────────────────────
+function drawAllyMarkers(s) {
+    if (!s.ally_pos_raw) return;
+    const c = `rgb(${ALLY_RGB})`;
+    const mp = s.ally_pos_raw['ally_main_robot_pos'];
+    if (mp) diamond(mp.x, mp.y, 0.04, c, 2);
+    for (let i = 1; i <= 3; i++) {
+        const p = s.ally_pos_raw[`ally_other_pos_${i}`];
+        if (p) xcross(p.x, p.y, 0.03, c, 2);
+    }
+    const bp = s.ally_pos_raw['ally_ball_pos'];
+    if (bp) star(bp.x, bp.y, 0.035, c);
+}
+
+// ── Status text ───────────────────────────────────────────────────────────────
+function drawStatus(s) {
+    const pos = s.robot_pos
+        ? `(${s.robot_pos[0].toFixed(2)}, ${s.robot_pos[1].toFixed(2)})`
+        : 'unknown';
+    const hdg = s.heading != null ? s.heading.toFixed(1) : '0.0';
+    const walls = s.walls ? s.walls.length : 0;
+    const bots  = s.other_robots ? s.other_robots.length : 0;
+    const lines = [
+        `pos=${pos}  heading=${hdg}°`,
+        `walls=${walls}  bots=${bots}`
+    ];
+    const pad = 4, lh = 15;
+    ctx.font = '12px monospace';
+    const maxW = Math.max(...lines.map(l => ctx.measureText(l).width));
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = 'white';
+    ctx.fillRect(5, 5, maxW + pad * 2, lines.length * lh + pad * 2);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#333';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    lines.forEach((l, i) => ctx.fillText(l, 5 + pad, 5 + pad + i * lh));
+}
+
+// ── Game state HTML panel ─────────────────────────────────────────────────────
+const gsEl = document.getElementById('gs');
+function updateGameState(s) {
+    if (!s.field_sectors) { gsEl.textContent = 'game state: —'; return; }
+    const gs   = s.field_sectors.game_state || {};
+    const ctrl = s.field_sectors.ball_control;
+    const state    = gs.state    || '—';
+    const strength = gs.strength || '';
+    const team     = gs.team != null ? `T${gs.team}` : '—';
+    const side     = gs.side     || '—';
+    const sub      = gs.substate || '—';
+    let ctrlStr = 'none';
+    if (ctrl) {
+        const cid = ctrl.id, ct = ctrl.team;
+        ctrlStr = cid == null ? `self (T${ct})` : `#${cid} (T${ct})`;
+    }
+    gsEl.textContent = `${strength} ${state}  ${team}  ·  ${side}  ·  ${sub}\nctrl: ${ctrlStr}`;
+}
+
+// ── Main render ───────────────────────────────────────────────────────────────
+function render(s) {
+    ctx.clearRect(0, 0, W, H);
+    drawField();
+    drawWalls(s);
+    drawLidar(s);
+
+    // History trails
+    drawTrail(s.position_history,     sc(0.018), '43,122,43',  0.7);
+    drawRobotHistory(s);
+    drawTrail(s.ball_history,         sc(0.014), '255,140,0',  0.7);
+
+    drawRawDetections(s);
+    drawAllyMarkers(s);
+    drawOtherRobots(s);
+    drawOwnRobot(s);
+    drawBall(s);
+    drawStatus(s);
+    updateGameState(s);
+}
+
+// ── SSE connection ────────────────────────────────────────────────────────────
+const fpsEl = document.getElementById('fps');
+let frameCount = 0, lastFpsTime = performance.now();
+let lastState  = null;
+
+function connect() {
+    const es = new EventSource('/events');
+    es.onmessage = e => {
+        try {
+            lastState = JSON.parse(e.data);
+        } catch (_) {}
+    };
+    es.onerror = () => {
+        fpsEl.textContent = 'reconnecting…';
+        es.close();
+        setTimeout(connect, 1000);
+    };
+}
+connect();
+
+// Render loop driven by rAF — decouples rendering from SSE delivery rate
+function loop() {
+    if (lastState) {
+        render(lastState);
+        frameCount++;
+        const now = performance.now();
+        if (now - lastFpsTime >= 1000) {
+            fpsEl.textContent = `${frameCount} fps`;
+            frameCount = 0;
+            lastFpsTime = now;
+        }
+    }
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>"""
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass  # suppress per-request console noise
+        pass
 
     def do_GET(self):
         path = self.path.split("?")[0]
-
         if path == "/":
             body = _HTML.encode()
             self.send_response(200)
@@ -558,51 +564,59 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
-        elif path == "/frame.png":
-            with _frame_lock:
-                body = _frame_bytes
-            if not body:
-                self.send_response(503)
-                self.end_headers()
-                return
+        elif path == "/events":
             self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Type",  "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection",    "keep-alive")
             self.end_headers()
-            self.wfile.write(body)
+            last_seq = -1
+            while True:
+                with _push_cond:
+                    _push_cond.wait_for(lambda: _push_seq != last_seq, timeout=5.0)
+                    cur_seq = _push_seq
+                if cur_seq == last_seq:
+                    try:
+                        self.wfile.write(b": ka\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+                    continue
+                last_seq = cur_seq
+                with _state_lock:
+                    data = _build_state()
+                try:
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                    self.wfile.flush()
+                except Exception:
+                    break
 
         else:
             self.send_response(404)
             self.end_headers()
 
 
-# ── Broker callbacks ──────────────────────────────────────────────────────────
+# ── Broker callbacks (identical to node_dev_twin_vis) ─────────────────────────
 
 def on_update(key, value):
     global _lidar, _detection_origin, _detection_heading, _imu_pitch
     global _robot_pos, _other_robots, _walls
     global _position_history, _other_robots_history
     global _ball_pos, _ball_hidden_pos, _ball_lost, _ball_vx, _ball_vy, _ball_history
-    global _sim_ball_pos, _sim_state, _ally_id, _ally_pos_raw
-    global _raw_robots, _ball_raw, _field_sectors
+    global _ally_id, _ally_pos_raw, _raw_robots, _ball_raw, _field_sectors
 
     if value is None:
         return
-
     try:
         with _state_lock:
             if key == "lidar":
-                raw = json.loads(value)
+                raw = __import__('json').loads(value)
                 _lidar = {int(k): int(v) for k, v in raw.items()}
-
             elif key == "imu_pitch":
                 _imu_pitch = float(value)
-
             elif key == "robot_position":
                 p = json.loads(value)
                 _robot_pos = (float(p["x"]), float(p["y"]))
-
             elif key == "other_robots":
                 payload = json.loads(value)
                 if isinstance(payload, dict):
@@ -618,16 +632,12 @@ def on_update(key, value):
                                    r.get("method", ""), int(r.get("id", 0)),
                                    bool(r.get("ally", False))]
                                   for r in robot_list]
-
             elif key == "lidar_walls":
                 _walls = json.loads(value)
-
             elif key == "position_history":
                 _position_history = json.loads(value)
-
             elif key == "other_robots_history":
                 _other_robots_history = json.loads(value)
-
             elif key == "ball":
                 payload          = json.loads(value)
                 _ball_pos        = payload.get("global_pos")
@@ -635,29 +645,19 @@ def on_update(key, value):
                 _ball_lost       = bool(payload.get("ball_lost", False))
                 _ball_vx         = payload.get("vx")
                 _ball_vy         = payload.get("vy")
-                _sim_ball_pos    = payload.get("sim_pos")
-
             elif key == "ball_history":
                 _ball_history = json.loads(value)
-
-            elif key == "sim_state":
-                _sim_state = json.loads(value)
-
             elif key == "raw_robots":
                 _raw_robots = json.loads(value)
-
             elif key == "ball_raw":
                 _ball_raw = json.loads(value)
-
             elif key == "field_sectors":
                 _field_sectors = json.loads(value)
-
             elif key == "ally_id":
                 try:
                     _ally_id = int(value) if value else None
                 except (ValueError, TypeError):
                     _ally_id = None
-
             elif key in ("ally_main_robot_pos", "ally_other_pos_1",
                          "ally_other_pos_2", "ally_other_pos_3", "ally_ball_pos"):
                 try:
@@ -665,9 +665,11 @@ def on_update(key, value):
                     _ally_pos_raw[key] = {"x": float(p["x"]), "y": float(p["y"])}
                 except Exception:
                     _ally_pos_raw.pop(key, None)
-
     except Exception as e:
         print(f"[WEB-VIS] parse error on {key!r}: {e}")
+        return
+
+    _notify()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -677,14 +679,15 @@ if __name__ == "__main__":
         "imu_pitch":            lambda v: float(v),
         "lidar":                lambda v: {int(k): int(x) for k, x in json.loads(v).items()},
         "robot_position":       lambda v: (float(json.loads(v)["x"]), float(json.loads(v)["y"])),
-        "other_robots":         lambda v: [[float(r["x"]), float(r["y"]), r.get("method", ""), int(r.get("id", 0)), bool(r.get("ally", False))]
-                                            for r in (lambda p: p.get("robots", p) if isinstance(p, dict) else p)(json.loads(v))],
+        "other_robots":         lambda v: [[float(r["x"]), float(r["y"]), r.get("method", ""),
+                                            int(r.get("id", 0)), bool(r.get("ally", False))]
+                                           for r in (lambda p: p.get("robots", p)
+                                                     if isinstance(p, dict) else p)(json.loads(v))],
         "lidar_walls":          lambda v: json.loads(v),
         "position_history":     lambda v: json.loads(v),
         "other_robots_history": lambda v: json.loads(v),
         "ball":                 lambda v: json.loads(v),
         "ball_history":         lambda v: json.loads(v),
-        "sim_state":            lambda v: json.loads(v),
         "ally_id":              lambda v: int(v) if v and v.strip() else None,
         "raw_robots":           lambda v: json.loads(v),
         "ball_raw":             lambda v: json.loads(v),
@@ -700,7 +703,6 @@ if __name__ == "__main__":
         "other_robots_history": "_other_robots_history",
         "ball":                 "_ball_pos",
         "ball_history":         "_ball_history",
-        "sim_state":            "_sim_state",
         "ally_id":              "_ally_id",
         "raw_robots":           "_raw_robots",
         "ball_raw":             "_ball_raw",
@@ -718,12 +720,9 @@ if __name__ == "__main__":
                   "ally_other_pos_2", "ally_other_pos_3", "ally_ball_pos"]
     mb.setcallback(list(_SEEDS.keys()) + _ally_keys, on_update)
 
-    threading.Thread(target=mb.receiver_loop, daemon=True,
-                     name="broker-receiver").start()
-    threading.Thread(target=_render_loop,     daemon=True,
-                     name="render").start()
+    threading.Thread(target=mb.receiver_loop, daemon=True, name="broker").start()
 
-    print(f"[WEB-VIS] Serving at http://{HOST}:{PORT}/  ({RENDER_HZ} fps)")
+    print(f"[WEB-VIS] Serving at http://{HOST}:{PORT}/")
     server = HTTPServer((HOST, PORT), _Handler)
     try:
         server.serve_forever()
