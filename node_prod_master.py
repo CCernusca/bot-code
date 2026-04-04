@@ -102,6 +102,7 @@ def all_robots():
     """All tracked other robots (detections and predictions).
 
     Returns a list of {"id": int, "x": float, "y": float,
+                        "vx": float|None, "vy": float|None,
                         "predicted": bool, "team": int}.
     The ally robot (same team as us) has team=0; all others have team=1.
     """
@@ -117,6 +118,8 @@ def all_robots():
             "id":        rid,
             "x":         float(x),
             "y":         float(y),
+            "vx":        r.get("vx"),
+            "vy":        r.get("vy"),
             "predicted": r.get("method") == "predicted",
             "team":      TEAM_US if rid == _ally_id else TEAM_ENEMY,
         })
@@ -281,18 +284,36 @@ def robot_in_file(robot_id, file):
 
 # ── Game state ────────────────────────────────────────────────────────────────
 
-def _ball_substate(dominant_team):
-    """'front' if ball moves toward dominant team's target goal, 'back' otherwise."""
-    if _ball is None or dominant_team is None:
+def _velocity_score(dominant_team):
+    """
+    Sum of directional contributions (+1 / -1) from every robot on the
+    dominant team and the ball, based on whether their vy points toward that
+    team's target goal.
+
+    Team 0 attacks upward   (vy > 0 → +1).
+    Team 1 attacks downward (vy < 0 → +1).
+    Zero velocity or missing data contributes 0.
+    Returns None when dominant_team is None.
+    """
+    if dominant_team is None:
         return None
-    vy = _ball.get("vy")
-    if vy is None or vy == 0:
-        return None
-    # Team 0 attacks upward (toward team 1's top goal): front = vy > 0
-    # Team 1 attacks downward (toward team 0's bottom goal): front = vy < 0
-    if dominant_team == TEAM_US:
-        return "front" if vy > 0 else "back"
-    return "front" if vy < 0 else "back"
+
+    def _contrib(vy):
+        if not vy:
+            return 0
+        if dominant_team == TEAM_US:
+            return 1 if vy > 0 else -1
+        return 1 if vy < 0 else -1
+
+    score = 0
+    for r in all_robots():
+        if r["team"] == dominant_team:
+            score += _contrib(r.get("vy"))
+
+    if _ball is not None:
+        score += _contrib(_ball.get("vy"))
+
+    return score
 
 
 def _ball_side():
@@ -389,7 +410,7 @@ def game_state():
         "strength": dominant_strength,
         "team":     dominant_team,
         "side":     _ball_side(),
-        "substate": _ball_substate(dominant_team),
+        "velocity": _velocity_score(dominant_team),
         "team0":    s0,
         "team1":    s1,
     }

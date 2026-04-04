@@ -470,7 +470,8 @@ def _redraw():
         strength_str = gs.get("strength") or ""
         team_val     = gs.get("team")
         side_str     = gs.get("side")     or "—"
-        substate_str = gs.get("substate") or "—"
+        velocity_val = gs.get("velocity")
+        vel_str      = f"{velocity_val:+d}" if velocity_val is not None else "—"
         team_str     = f"T{team_val}" if team_val is not None else "—"
 
         ctrl_str = "none"
@@ -480,7 +481,7 @@ def _redraw():
             ctrl_str = f"self (T{cteam})" if cid is None else f"#{cid} (T{cteam})"
 
         _art_game_state.set_text(
-            f"{strength_str} {state_str}  {team_str}  ·  {side_str}  ·  {substate_str}\n"
+            f"{strength_str} {state_str}  {team_str}  ·  {side_str}  ·  v{vel_str}\n"
             f"ctrl: {ctrl_str}"
         )
     else:
