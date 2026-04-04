@@ -14,55 +14,54 @@ SIM_PHYSICS_HZ   = 60             # physics updates per second
 SIM_SCAN_HZ      = 10             # complete lidar scan cycles per second
 
 # ── Field geometry ─────────────────────────────────────────────────────────────
-# Total field (including 12 cm outer area): 1.82 × 2.43 m
-# Playing field (inside white line):        1.58 × 2.19 m
-# Outer area margin:  0.12 m on all sides
-# Goals (centered on each short side):      0.60 m wide, 74 mm deep from white line
-# Goal posts sit over the white line.
+# Playing field (inside white line): FIELD_WIDTH × FIELD_HEIGHT = 1.58 × 2.19 m
+# Outer area margin:  OUTER_MARGIN = 0.12 m on all sides (outside field dims)
+# Total space:        1.82 × 2.43 m  (= playing field + 2 × outer margin)
+# Goals (centred on each short side): GOAL_WIDTH = 0.60 m wide, in the outer margin.
+#   The outer wall is the goal back wall.  Goal side walls run from the outer
+#   wall to the playing-field border (white line).  No concave notch in outer wall.
 
-_OUTER_MARGIN = 0.12   # m
-_GOAL_WIDTH   = 0.60   # m  inner goal width
-_GOAL_DEPTH   = 0.074  # m  depth from white line toward outer wall
+OUTER_MARGIN = 0.12   # m  (exported — used by other nodes)
+_GOAL_WIDTH  = 0.60   # m  inner goal width
 
 
-def _build_wall_segments(width, length):
+def _build_wall_segments(field_w, field_h):
     """
-    Return wall segments for a field of given total dimensions (outer wall to
-    outer wall), with goals centred on each short side.
+    Return wall segments for a playing field of given dimensions (white-line to
+    white-line), with goals centred on each short side in the outer margin.
+
+    The outer walls form a complete rectangle at ±OUTER_MARGIN beyond the playing
+    field.  Goal side walls are the only additional structure; the outer wall
+    itself serves as the goal back wall.
 
     Each segment is a tuple:
         (is_horiz, fixed_val, rng_min, rng_max)
 
     is_horiz=True  → horizontal wall at y=fixed_val, x ∈ [rng_min, rng_max]
     is_horiz=False → vertical   wall at x=fixed_val, y ∈ [rng_min, rng_max]
+
+    All coordinates use the playing-field origin: (0,0) = bottom-left white-line
+    corner.  The outer walls sit at −OUTER_MARGIN and field_w/h + OUTER_MARGIN.
     """
-    gx_min     = (width  - _GOAL_WIDTH) / 2          # x = 0.61 m
-    gx_max     = (width  + _GOAL_WIDTH) / 2          # x = 1.21 m
-    # Goal back walls sit inside the outer area, _GOAL_DEPTH from the white line.
-    g_back_bot = _OUTER_MARGIN - _GOAL_DEPTH          # y ≈ 0.046 m
-    g_back_top = length - _OUTER_MARGIN + _GOAL_DEPTH # y ≈ 2.384 m
-    white_bot  = _OUTER_MARGIN                        # y = 0.12 m
-    white_top  = length - _OUTER_MARGIN               # y = 2.31 m
+    ox0    = -OUTER_MARGIN               # left / bottom outer wall
+    ox1    =  field_w + OUTER_MARGIN     # right outer wall
+    oy0    = -OUTER_MARGIN               # bottom outer wall
+    oy1    =  field_h + OUTER_MARGIN     # top outer wall
+    gx_min = (field_w - _GOAL_WIDTH) / 2
+    gx_max = (field_w + _GOAL_WIDTH) / 2
 
     return [
-        # Long side walls (full length)
-        (False, 0.0,   0.0,    length),
-        (False, width, 0.0,    length),
-        # Short outer walls — outside goal width (bottom)
-        (True,  0.0,    0.0,    gx_min),
-        (True,  0.0,    gx_max, width),
-        # Short outer walls — outside goal width (top)
-        (True,  length, 0.0,    gx_min),
-        (True,  length, gx_max, width),
-        # Goal back walls
-        (True,  g_back_bot, gx_min, gx_max),
-        (True,  g_back_top, gx_min, gx_max),
-        # Goal side walls — bottom goal  (y ∈ [g_back_bot, white_bot])
-        (False, gx_min, g_back_bot, white_bot),
-        (False, gx_max, g_back_bot, white_bot),
-        # Goal side walls — top goal     (y ∈ [white_top, g_back_top])
-        (False, gx_min, white_top, g_back_top),
-        (False, gx_max, white_top, g_back_top),
+        # Outer walls — complete rectangle
+        (False, ox0,  oy0, oy1),   # left
+        (False, ox1,  oy0, oy1),   # right
+        (True,  oy0,  ox0, ox1),   # bottom
+        (True,  oy1,  ox0, ox1),   # top
+        # Goal side walls — bottom goal  (y ∈ [oy0, 0])
+        (False, gx_min, oy0, 0.0),
+        (False, gx_max, oy0, 0.0),
+        # Goal side walls — top goal     (y ∈ [field_h, oy1])
+        (False, gx_min, field_h, oy1),
+        (False, gx_max, field_h, oy1),
     ]
 
 
@@ -75,7 +74,8 @@ def _cast_rays_np(px, py, heading_deg, obstacles, wall_segments, angles_deg, obs
     angles_deg    : 1-D numpy array of sensor angles in degrees.
     heading_deg   : scalar field-heading offset (degrees).
     wall_segments : list of (is_horiz, fixed_val, rng_min, rng_max) from
-                    _build_wall_segments().
+                    _build_wall_segments().  Coordinates are in the playing-field
+                    frame: (0,0) = bottom-left white-line corner.
     Returns a 1-D numpy array of distances in metres, one per angle.
     """
     rad = np.radians(angles_deg + heading_deg)
@@ -227,7 +227,7 @@ def _physics_loop(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
 # ── Public interface ──────────────────────────────────────────────────────────
 
 def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on_state=None,
-                    width=1.82, length=2.43, step_size=1, proximity=0.1, robot_radius=0.09):
+                    width=1.58, length=2.19, step_size=1, proximity=0.1, robot_radius=0.09):
     """
     Simulates RPLidar C1 with independent physics and lidar threads.
 
@@ -332,9 +332,9 @@ def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on
         physics_thread.join(timeout=1.0)
 
 
-def get_boundary_distances(width=1.0, length=2.0, step_size=1, proximity=0.1, robot_radius=0.1):
-    # Spawn robot inside the playing field (inside the white line)
-    margin = _OUTER_MARGIN + robot_radius
+def get_boundary_distances(width=1.58, length=2.19, step_size=1, proximity=0.1, robot_radius=0.1):
+    # Spawn robot inside the playing field (clear of the white line)
+    margin = robot_radius + 0.05
     px      = random.uniform(margin, width  - margin)
     py      = random.uniform(margin, length - margin)
     angle_f = random.uniform(0, 360)
