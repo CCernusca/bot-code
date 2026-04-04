@@ -27,8 +27,8 @@ BALL_RADIUS_MM = 21.0
 ROBOT_RADIUS = 0.09
 
 # ── Field dimensions ──────────────────────────────────────────────────────────
-FIELD_WIDTH  = 1.82
-FIELD_HEIGHT = 2.43
+FIELD_WIDTH  = 1.58   # metres — playing field only
+FIELD_HEIGHT = 2.19
 
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball_raw"
@@ -169,8 +169,8 @@ def _process_frame(frame):
 
 
 class _SimBall:
-    FIELD_W  = 1.82
-    FIELD_H  = 2.43
+    FIELD_W  = 1.58
+    FIELD_H  = 2.19
     BALL_R   = BALL_RADIUS_MM / 1000.0
     MARGIN   = BALL_R + 0.02
     SPEED    = 0.6

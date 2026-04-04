@@ -11,10 +11,12 @@ from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
 
 # ── Field configuration ───────────────────────────────────────────────────────
-FIELD_WIDTH  = 1.82   # metres
-FIELD_HEIGHT = 2.43   # metres
+FIELD_WIDTH  = 1.58   # metres — playing field only (white line to white line)
+FIELD_HEIGHT = 2.19   # metres
 ROBOT_RADIUS = 0.09   # metres
-_MARGIN         = 0.25
+OUTER_MARGIN = 0.12   # outer area beyond white line on all sides
+GOAL_WIDTH   = 0.60   # goal inner width (centred on each short side)
+_MARGIN         = 0.10   # extra plot margin beyond the outer walls
 _MAX_VIS_ROBOTS = 3
 _MAX_WALLS      = 4   # pre-allocated wall line slots per detection source
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,18 +62,47 @@ fig, ax = plt.subplots(figsize=(6, 9))
 plt.tight_layout(pad=1.5)
 
 # Fixed axes — set once, never changed (required for stable blitting)
-ax.set_xlim(-_MARGIN, FIELD_WIDTH  + _MARGIN)
-ax.set_ylim(-_MARGIN, FIELD_HEIGHT + _MARGIN)
+_OW = OUTER_MARGIN   # shorthand
+ax.set_xlim(-_OW - _MARGIN, FIELD_WIDTH  + _OW + _MARGIN)
+ax.set_ylim(-_OW - _MARGIN, FIELD_HEIGHT + _OW + _MARGIN)
 ax.set_aspect('equal')
 ax.set_xlabel('X (m)')
 ax.set_ylabel('Y (m)')
 ax.grid(True, alpha=0.25, zorder=0)
 
-# Static background artist (not animated — baked into cached background)
+# ── Static background (baked into cached background, not animated) ────────────
+_gx_min = (FIELD_WIDTH - GOAL_WIDTH) / 2
+_gx_max = (FIELD_WIDTH + GOAL_WIDTH) / 2
+
+# Outer area (outer wall rectangle, matte black/dark)
+ax.add_patch(patches.Rectangle(
+    (-_OW, -_OW), FIELD_WIDTH + 2 * _OW, FIELD_HEIGHT + 2 * _OW,
+    linewidth=2, edgecolor='#222222', facecolor='#cccccc', zorder=1,
+))
+
+# Playing field (inner green)
 ax.add_patch(patches.Rectangle(
     (0, 0), FIELD_WIDTH, FIELD_HEIGHT,
-    linewidth=2, edgecolor='#888888', facecolor='#f8f8f8', zorder=1,
+    linewidth=1, edgecolor='white', facecolor='#c8e6c9', zorder=2,
 ))
+
+# Bottom goal — yellow interior
+ax.add_patch(patches.Rectangle(
+    (_gx_min, -_OW), GOAL_WIDTH, _OW,
+    linewidth=0, facecolor='#ffee44', zorder=3,
+))
+# Top goal — blue interior
+ax.add_patch(patches.Rectangle(
+    (_gx_min, FIELD_HEIGHT), GOAL_WIDTH, _OW,
+    linewidth=0, facecolor='#4488ff', zorder=3,
+))
+
+# Goal side walls (solid black lines in the outer margin)
+for _gx in (_gx_min, _gx_max):
+    ax.add_line(plt.Line2D([_gx, _gx], [-_OW, 0.0],
+                           color='#222222', lw=2, zorder=4))
+    ax.add_line(plt.Line2D([_gx, _gx], [FIELD_HEIGHT, FIELD_HEIGHT + _OW],
+                           color='#222222', lw=2, zorder=4))
 
 # ── Pre-allocated animated artists ───────────────────────────────────────────
 
@@ -108,8 +139,8 @@ _art_arrow = FancyArrowPatch((0, 0), (0.1, 0),
 ax.add_patch(_art_arrow)
 
 # Wall lines — 4 primary + 4 hist
-_WSPAN_X = (-_MARGIN, FIELD_WIDTH  + _MARGIN)
-_WSPAN_Y = (-_MARGIN, FIELD_HEIGHT + _MARGIN)
+_WSPAN_X = (-_OW - _MARGIN, FIELD_WIDTH  + _OW + _MARGIN)
+_WSPAN_Y = (-_OW - _MARGIN, FIELD_HEIGHT + _OW + _MARGIN)
 
 def _wall_line(color, ls):
     (ln,) = ax.plot([], [], color=color, lw=1.5, ls=ls,

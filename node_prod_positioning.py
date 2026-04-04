@@ -8,9 +8,10 @@ import threading
 import numpy as np
 
 # ── Field configuration ───────────────────────────────────────────────────────
-FIELD_WIDTH  = 1.82   # metres
-FIELD_HEIGHT = 2.43
+FIELD_WIDTH  = 1.58   # metres — playing field only (white line to white line)
+FIELD_HEIGHT = 2.19
 ROBOT_RADIUS = 0.09
+OUTER_MARGIN = 0.12   # outer area beyond the white line on all sides
 
 # ── Wall detection ────────────────────────────────────────────────────────────
 WALL_TOL        = 0.05   # metres
@@ -149,22 +150,24 @@ def _compute_position(rel_pts):
         offset   = float(wall.get("offset", 0.0))
 
         if gradient is None:
-            for rx in (-offset, FIELD_WIDTH - offset):
+            # Outer walls at x = -OUTER_MARGIN and x = FIELD_WIDTH + OUTER_MARGIN
+            for rx in (-OUTER_MARGIN - offset, FIELD_WIDTH + OUTER_MARGIN - offset):
                 if not (ROBOT_RADIUS - _POS_MARGIN <= rx <= FIELD_WIDTH - ROBOT_RADIUS + _POS_MARGIN):
                     continue
                 if len(rel_pts) > 0 and not (
-                    rx + lidar_min_x >= -_LIDAR_FIELD_TOL and
-                    rx + lidar_max_x <= FIELD_WIDTH + _LIDAR_FIELD_TOL
+                    rx + lidar_min_x >= -OUTER_MARGIN - _LIDAR_FIELD_TOL and
+                    rx + lidar_max_x <= FIELD_WIDTH + OUTER_MARGIN + _LIDAR_FIELD_TOL
                 ):
                     continue
                 x_candidates.append(rx)
         else:
-            for ry in (-offset, FIELD_HEIGHT - offset):
+            # Outer walls at y = -OUTER_MARGIN and y = FIELD_HEIGHT + OUTER_MARGIN
+            for ry in (-OUTER_MARGIN - offset, FIELD_HEIGHT + OUTER_MARGIN - offset):
                 if not (ROBOT_RADIUS - _POS_MARGIN <= ry <= FIELD_HEIGHT - ROBOT_RADIUS + _POS_MARGIN):
                     continue
                 if len(rel_pts) > 0 and not (
-                    ry + lidar_min_y >= -_LIDAR_FIELD_TOL and
-                    ry + lidar_max_y <= FIELD_HEIGHT + _LIDAR_FIELD_TOL
+                    ry + lidar_min_y >= -OUTER_MARGIN - _LIDAR_FIELD_TOL and
+                    ry + lidar_max_y <= FIELD_HEIGHT + OUTER_MARGIN + _LIDAR_FIELD_TOL
                 ):
                     continue
                 y_candidates.append(ry)

@@ -28,8 +28,8 @@ BALL_RADIUS_MM = 21.0  # Real-world ball radius in mm (used for distance calc)
 ROBOT_RADIUS = 0.09   # metres — camera sits one radius ahead of the robot centre
 
 # ── Field dimensions (used by SimBall physics) ────────────────────────────────
-FIELD_WIDTH  = 1.82
-FIELD_HEIGHT = 2.43
+FIELD_WIDTH  = 1.58   # metres — playing field only
+FIELD_HEIGHT = 2.19
 
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball_raw"
@@ -132,8 +132,8 @@ class _SimBall:
     by node_lidar when running in simulation mode).
     """
 
-    FIELD_W  = 1.82
-    FIELD_H  = 2.43
+    FIELD_W  = 1.58
+    FIELD_H  = 2.19
     BALL_R   = BALL_RADIUS_MM / 1000.0   # 0.021 m
     MARGIN   = BALL_R + 0.02             # minimum distance from walls
     SPEED    = 0.6                        # m/s — initial ball speed

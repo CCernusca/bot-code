@@ -7,8 +7,8 @@ import time
 import numpy as np
 
 # ── Field dimensions ──────────────────────────────────────────────────────────
-FIELD_WIDTH  = 1.82   # metres
-FIELD_HEIGHT = 2.43
+FIELD_WIDTH  = 1.58   # metres — playing field only
+FIELD_HEIGHT = 2.19
 ROBOT_RADIUS = 0.09
 
 # ── Robot dead-reckoning ──────────────────────────────────────────────────────

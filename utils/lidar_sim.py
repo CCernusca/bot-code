@@ -13,28 +13,90 @@ SIM_MAX_TURN_RAD = math.radians(90)  # rad/s — maximum heading turn rate
 SIM_PHYSICS_HZ   = 60             # physics updates per second
 SIM_SCAN_HZ      = 10             # complete lidar scan cycles per second
 
+# ── Field geometry ─────────────────────────────────────────────────────────────
+# Playing field (inside white line): FIELD_WIDTH × FIELD_HEIGHT = 1.58 × 2.19 m
+# Outer area margin:  OUTER_MARGIN = 0.12 m on all sides (outside field dims)
+# Total space:        1.82 × 2.43 m  (= playing field + 2 × outer margin)
+# Goals (centred on each short side): GOAL_WIDTH = 0.60 m wide, in the outer margin.
+#   The outer wall is the goal back wall.  Goal side walls run from the outer
+#   wall to the playing-field border (white line).  No concave notch in outer wall.
+
+OUTER_MARGIN = 0.12   # m  (exported — used by other nodes)
+_GOAL_WIDTH  = 0.60   # m  inner goal width
+
+
+def _build_wall_segments(field_w, field_h):
+    """
+    Return wall segments for a playing field of given dimensions (white-line to
+    white-line), with goals centred on each short side in the outer margin.
+
+    The outer walls form a complete rectangle at ±OUTER_MARGIN beyond the playing
+    field.  Goal side walls are the only additional structure; the outer wall
+    itself serves as the goal back wall.
+
+    Each segment is a tuple:
+        (is_horiz, fixed_val, rng_min, rng_max)
+
+    is_horiz=True  → horizontal wall at y=fixed_val, x ∈ [rng_min, rng_max]
+    is_horiz=False → vertical   wall at x=fixed_val, y ∈ [rng_min, rng_max]
+
+    All coordinates use the playing-field origin: (0,0) = bottom-left white-line
+    corner.  The outer walls sit at −OUTER_MARGIN and field_w/h + OUTER_MARGIN.
+    """
+    ox0    = -OUTER_MARGIN               # left / bottom outer wall
+    ox1    =  field_w + OUTER_MARGIN     # right outer wall
+    oy0    = -OUTER_MARGIN               # bottom outer wall
+    oy1    =  field_h + OUTER_MARGIN     # top outer wall
+    gx_min = (field_w - _GOAL_WIDTH) / 2
+    gx_max = (field_w + _GOAL_WIDTH) / 2
+
+    return [
+        # Outer walls — complete rectangle
+        (False, ox0,  oy0, oy1),   # left
+        (False, ox1,  oy0, oy1),   # right
+        (True,  oy0,  ox0, ox1),   # bottom
+        (True,  oy1,  ox0, ox1),   # top
+        # Goal side walls — bottom goal  (y ∈ [oy0, 0])
+        (False, gx_min, oy0, 0.0),
+        (False, gx_max, oy0, 0.0),
+        # Goal side walls — top goal     (y ∈ [field_h, oy1])
+        (False, gx_min, field_h, oy1),
+        (False, gx_max, field_h, oy1),
+    ]
+
 
 # ── Ray casting ───────────────────────────────────────────────────────────────
 
-def _cast_rays_np(px, py, heading_deg, obstacles, width, length, angles_deg, obstacle_radius):
+def _cast_rays_np(px, py, heading_deg, obstacles, wall_segments, angles_deg, obstacle_radius):
     """
     Cast all rays at once using numpy.
 
-    angles_deg      : 1-D numpy array of sensor angles in degrees.
-    heading_deg     : scalar field-heading offset (degrees).
+    angles_deg    : 1-D numpy array of sensor angles in degrees.
+    heading_deg   : scalar field-heading offset (degrees).
+    wall_segments : list of (is_horiz, fixed_val, rng_min, rng_max) from
+                    _build_wall_segments().  Coordinates are in the playing-field
+                    frame: (0,0) = bottom-left white-line corner.
     Returns a 1-D numpy array of distances in metres, one per angle.
     """
     rad = np.radians(angles_deg + heading_deg)
     ux  = np.cos(rad)
     uy  = np.sin(rad)
 
+    dists = np.full(len(angles_deg), np.inf)
+
     with np.errstate(divide='ignore', invalid='ignore'):
-        dists = np.minimum.reduce([
-            np.where(ux >  1e-9, (width  - px) / ux, np.inf),
-            np.where(ux < -1e-9,            -px / ux, np.inf),
-            np.where(uy >  1e-9, (length - py) / uy, np.inf),
-            np.where(uy < -1e-9,            -py / uy, np.inf),
-        ])
+        for is_horiz, fixed_val, rng_min, rng_max in wall_segments:
+            if is_horiz:
+                # horizontal wall at y = fixed_val
+                t     = np.where(np.abs(uy) > 1e-9, (fixed_val - py) / uy, np.inf)
+                hit_x = px + t * ux
+                valid = (t > 1e-9) & (hit_x >= rng_min) & (hit_x <= rng_max)
+            else:
+                # vertical wall at x = fixed_val
+                t     = np.where(np.abs(ux) > 1e-9, (fixed_val - px) / ux, np.inf)
+                hit_y = py + t * uy
+                valid = (t > 1e-9) & (hit_y >= rng_min) & (hit_y <= rng_max)
+            dists = np.where(valid, np.minimum(dists, t), dists)
 
     for ox, oy in obstacles:
         ocx  = px - ox
@@ -55,10 +117,11 @@ def _cast_rays_np(px, py, heading_deg, obstacles, width, length, angles_deg, obs
     return dists
 
 
-def _cast_rays(px, py, angle_f, obstacles, width, length, step_size, obstacle_radius):
+def _cast_rays(px, py, angle_f, obstacles, wall_segments, step_size, obstacle_radius):
     """Full 360° scan — used by get_boundary_distances."""
     angles = np.arange(0, 360, step_size, dtype=float)
-    dists  = _cast_rays_np(px, py, angle_f, obstacles, width, length, angles, obstacle_radius)
+    dists  = _cast_rays_np(px, py, angle_f, obstacles, wall_segments,
+                           angles, obstacle_radius)
     return list(zip(angles.astype(int), dists.tolist()))
 
 
@@ -164,7 +227,7 @@ def _physics_loop(rob_pos, rob_vel, rob_heading, obs_pos, obs_vel,
 # ── Public interface ──────────────────────────────────────────────────────────
 
 def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on_state=None,
-                    width=1.82, length=2.43, step_size=1, proximity=0.1, robot_radius=0.09):
+                    width=1.58, length=2.19, step_size=1, proximity=0.1, robot_radius=0.09):
     """
     Simulates RPLidar C1 with independent physics and lidar threads.
 
@@ -177,6 +240,7 @@ def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on
     Stops on KeyboardInterrupt.
     """
     print("Starting simulated scan...")
+    wall_segments = _build_wall_segments(width, length)
     px, py, angle_f, _, _, init_obstacles, _ = get_boundary_distances(
         width, length, step_size, proximity, robot_radius
     )
@@ -231,7 +295,7 @@ def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on
 
             # Vectorised raycasting — all 360 rays in one numpy call
             dists_m  = _cast_rays_np(rx, ry, heading_deg, obs_snap,
-                                     width, length, angles_np, proximity)
+                                     wall_segments, angles_np, proximity)
             dists_mm = (dists_m * 1000.0)
             if SIM_JITTER_MM > 0:
                 dists_mm += np.random.normal(0.0, SIM_JITTER_MM, len(angles_np))
@@ -268,21 +332,24 @@ def read_lidar_data(on_update, on_ready=None, get_heading=None, on_scan=None, on
         physics_thread.join(timeout=1.0)
 
 
-def get_boundary_distances(width=1.0, length=2.0, step_size=1, proximity=0.1, robot_radius=0.1):
-    px      = random.uniform(robot_radius, width  - robot_radius)
-    py      = random.uniform(robot_radius, length - robot_radius)
+def get_boundary_distances(width=1.58, length=2.19, step_size=1, proximity=0.1, robot_radius=0.1):
+    # Spawn robot inside the playing field (clear of the white line)
+    margin = robot_radius + 0.05
+    px      = random.uniform(margin, width  - margin)
+    py      = random.uniform(margin, length - margin)
     angle_f = random.uniform(0, 360)
 
     obstacles = []
     for _ in range(3):
         for _ in range(1000):
-            ox = random.uniform(proximity, width  - proximity)
-            oy = random.uniform(proximity, length - proximity)
+            ox = random.uniform(margin, width  - margin)
+            oy = random.uniform(margin, length - margin)
             if (math.hypot(ox - px, oy - py) >= robot_radius + proximity and
                     all(math.hypot(ox - ex, oy - ey) >= 2 * proximity
                         for ex, ey in obstacles)):
                 obstacles.append((ox, oy))
                 break
 
-    results = _cast_rays(px, py, angle_f, obstacles, width, length, step_size, proximity)
+    wall_segments = _build_wall_segments(width, length)
+    results = _cast_rays(px, py, angle_f, obstacles, wall_segments, step_size, proximity)
     return px, py, angle_f, width, length, obstacles, results
