@@ -11,15 +11,25 @@ from utils.perf_monitor import PerfMonitor
 FIELD_WIDTH  = 1.58   # metres — playing field only
 FIELD_HEIGHT = 2.19
 
-# ── Quadrant boundaries ───────────────────────────────────────────────────────
-# The field is divided into four equal quadrants along both axes.
+# ── Subdivision grid ──────────────────────────────────────────────────────────
+# The field is split into COLS × ROWS = 4 × 4 = 16 equal subdivisions.
 #
-#   top_left  │  top_right
-#   ──────────┼──────────
-#   bot_left  │  bot_right
+#   row 3 │ (0,3) (1,3) (2,3) (3,3) │
+#   row 2 │ (0,2) (1,2) (2,2) (3,2) │
+#   row 1 │ (0,1) (1,1) (2,1) (3,1) │
+#   row 0 │ (0,0) (1,0) (2,0) (3,0) │
+#           col 0  col 1  col 2  col 3
 #
-_MID_X = FIELD_WIDTH  / 2   # 0.79 m
-_MID_Y = FIELD_HEIGHT / 2   # 1.095 m
+# col  (0–3) : vertical strip, increases left → right
+# row  (0–3) : horizontal strip, increases bottom → top
+# rank        : synonym for row  — "which horizontal band"
+# vertical    : synonym for col  — "which vertical band"
+
+COLS = 4
+ROWS = 4
+
+_COL_W = FIELD_WIDTH  / COLS   # 0.395 m per column
+_ROW_H = FIELD_HEIGHT / ROWS   # 0.5475 m per row
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,41 +42,182 @@ _other_robots = None   # {"robots": [...]} from prediction node
 _ball         = None   # {"global_pos": {x,y}, "ball_lost": bool, ...}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Low-level subdivision math ────────────────────────────────────────────────
 
-def _quadrant(x, y):
-    """Return the quadrant name for a global field position."""
-    col = "right" if x >= _MID_X else "left"
-    row = "top"   if y >= _MID_Y else "bottom"
-    return f"{row}_{col}"
+def col_of(x):
+    """Vertical column index (0 = leftmost) for a global x coordinate."""
+    return max(0, min(COLS - 1, int(x / _COL_W)))
 
+
+def row_of(y):
+    """Horizontal row index (0 = bottommost) for a global y coordinate."""
+    return max(0, min(ROWS - 1, int(y / _ROW_H)))
+
+
+def subdiv_of(x, y):
+    """(col, row) subdivision indices for a global position."""
+    return col_of(x), row_of(y)
+
+
+# ── Position accessors ────────────────────────────────────────────────────────
+
+def self_pos():
+    """Own robot position, or None if unknown.
+
+    Returns {"x": float, "y": float}.
+    """
+    if _robot_pos is None:
+        return None
+    return {"x": float(_robot_pos["x"]), "y": float(_robot_pos["y"])}
+
+
+def all_robots():
+    """All tracked other robots (detections and predictions).
+
+    Returns a list of {"id": int, "x": float, "y": float, "predicted": bool}.
+    """
+    if _other_robots is None:
+        return []
+    out = []
+    for r in _other_robots.get("robots", []):
+        x, y = r.get("x"), r.get("y")
+        if x is None or y is None:
+            continue
+        out.append({
+            "id":        r.get("id"),
+            "x":         float(x),
+            "y":         float(y),
+            "predicted": r.get("method") == "predicted",
+        })
+    return out
+
+
+def robot_by_id(robot_id):
+    """Position of a specific tracked robot, or None.
+
+    Returns {"id": int, "x": float, "y": float, "predicted": bool}.
+    """
+    for r in all_robots():
+        if r["id"] == robot_id:
+            return r
+    return None
+
+
+def ball_pos():
+    """Ball position, or None if unavailable.
+
+    Returns {"x": float, "y": float, "lost": bool}.
+    """
+    if _ball is None:
+        return None
+    gpos = _ball.get("global_pos")
+    if gpos is None:
+        return None
+    return {
+        "x":    float(gpos["x"]),
+        "y":    float(gpos["y"]),
+        "lost": bool(_ball.get("ball_lost", False)),
+    }
+
+
+# ── Generic location predicates ───────────────────────────────────────────────
+
+def in_subdivision(x, y, col, row):
+    """True if (x, y) falls in subdivision (col, row)."""
+    return col_of(x) == col and row_of(y) == row
+
+
+def in_rank(x, y, rank):
+    """True if (x, y) is in horizontal row `rank` (0 = bottom, 3 = top)."""
+    return row_of(y) == rank
+
+
+def in_vertical(x, y, vertical):
+    """True if (x, y) is in vertical column `vertical` (0 = left, 3 = right)."""
+    return col_of(x) == vertical
+
+
+# ── Own-robot location helpers ────────────────────────────────────────────────
+
+def self_in_subdivision(col, row):
+    """True if the own robot is in subdivision (col, row)."""
+    p = self_pos()
+    return p is not None and in_subdivision(p["x"], p["y"], col, row)
+
+
+def self_in_rank(rank):
+    """True if the own robot is in horizontal row `rank`."""
+    p = self_pos()
+    return p is not None and in_rank(p["x"], p["y"], rank)
+
+
+def self_in_vertical(vertical):
+    """True if the own robot is in vertical column `vertical`."""
+    p = self_pos()
+    return p is not None and in_vertical(p["x"], p["y"], vertical)
+
+
+# ── Ball location helpers ─────────────────────────────────────────────────────
+
+def ball_in_subdivision(col, row):
+    """True if the ball is in subdivision (col, row)."""
+    p = ball_pos()
+    return p is not None and in_subdivision(p["x"], p["y"], col, row)
+
+
+def ball_in_rank(rank):
+    """True if the ball is in horizontal row `rank`."""
+    p = ball_pos()
+    return p is not None and in_rank(p["x"], p["y"], rank)
+
+
+def ball_in_vertical(vertical):
+    """True if the ball is in vertical column `vertical`."""
+    p = ball_pos()
+    return p is not None and in_vertical(p["x"], p["y"], vertical)
+
+
+# ── Per-robot location helpers ────────────────────────────────────────────────
+
+def robot_in_subdivision(robot_id, col, row):
+    """True if robot `robot_id` is in subdivision (col, row)."""
+    r = robot_by_id(robot_id)
+    return r is not None and in_subdivision(r["x"], r["y"], col, row)
+
+
+def robot_in_rank(robot_id, rank):
+    """True if robot `robot_id` is in horizontal row `rank`."""
+    r = robot_by_id(robot_id)
+    return r is not None and in_rank(r["x"], r["y"], rank)
+
+
+def robot_in_vertical(robot_id, vertical):
+    """True if robot `robot_id` is in vertical column `vertical`."""
+    r = robot_by_id(robot_id)
+    return r is not None and in_vertical(r["x"], r["y"], vertical)
+
+
+# ── Broker publish ────────────────────────────────────────────────────────────
 
 def _publish(now):
     state = {"t": round(now, 3)}
 
-    if _robot_pos is not None:
-        state["self"] = _quadrant(float(_robot_pos["x"]), float(_robot_pos["y"]))
+    p = self_pos()
+    if p is not None:
+        c, r = subdiv_of(p["x"], p["y"])
+        state["self"] = {"col": c, "row": r}
 
-    if _other_robots is not None:
-        entries = []
-        for r in _other_robots.get("robots", []):
-            x, y = r.get("x"), r.get("y")
-            if x is None or y is None:
-                continue
-            entries.append({
-                "id":        r.get("id"),
-                "quadrant":  _quadrant(float(x), float(y)),
-                "predicted": r.get("method") == "predicted",
-            })
-        state["robots"] = entries
+    robots_out = []
+    for rb in all_robots():
+        c, r = subdiv_of(rb["x"], rb["y"])
+        robots_out.append({"id": rb["id"], "col": c, "row": r,
+                            "predicted": rb["predicted"]})
+    state["robots"] = robots_out
 
-    if _ball is not None:
-        gpos = _ball.get("global_pos")
-        if gpos is not None:
-            state["ball"] = {
-                "quadrant": _quadrant(float(gpos["x"]), float(gpos["y"])),
-                "lost":     bool(_ball.get("ball_lost", False)),
-            }
+    bp = ball_pos()
+    if bp is not None:
+        c, r = subdiv_of(bp["x"], bp["y"])
+        state["ball"] = {"col": c, "row": r, "lost": bp["lost"]}
 
     mb.set("field_sectors", json.dumps(state))
 
