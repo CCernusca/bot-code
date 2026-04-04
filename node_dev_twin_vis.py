@@ -46,6 +46,7 @@ _ally_id              = None  # persistent ally robot ID from cooperation node
 _ally_pos_raw         = {}    # "ally_main_robot_pos" / "ally_other_pos_N" / "ally_ball_pos" → {"x","y"}
 _raw_robots           = None  # list of raw robot positions from positioning (without ally)
 _ball_raw             = None  # raw ball position from detection (without ally)
+_field_sectors        = None  # latest field_sectors payload from master node
 
 _state_lock   = threading.Lock()
 _needs_redraw = threading.Event()
@@ -206,6 +207,12 @@ _art_ally_ball = _ally_marker('*')   # ally's detected ball position
 # Status text (inside axes, top-left corner)
 _art_status = ax.text(0.01, 0.99, '', transform=ax.transAxes,
     ha='left', va='top', fontsize=8, animated=True, zorder=15,
+    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+              alpha=0.75, edgecolor='none'))
+
+# Game-state text (inside axes, bottom-left corner)
+_art_game_state = ax.text(0.01, 0.01, '', transform=ax.transAxes,
+    ha='left', va='bottom', fontsize=8, animated=True, zorder=15,
     bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
               alpha=0.75, edgecolor='none'))
 
@@ -454,6 +461,31 @@ def _redraw():
         f"walls={len(_walls)}  bots={len(_other_robots)}"
     )
 
+    # ── Game state text ───────────────────────────────────────────────────────
+    if _field_sectors is not None:
+        gs   = _field_sectors.get("game_state") or {}
+        ctrl = _field_sectors.get("ball_control")
+
+        state_str    = gs.get("state")    or "—"
+        strength_str = gs.get("strength") or ""
+        team_val     = gs.get("team")
+        side_str     = gs.get("side")     or "—"
+        substate_str = gs.get("substate") or "—"
+        team_str     = f"T{team_val}" if team_val is not None else "—"
+
+        ctrl_str = "none"
+        if ctrl is not None:
+            cid   = ctrl.get("id")
+            cteam = ctrl.get("team", "?")
+            ctrl_str = f"self (T{cteam})" if cid is None else f"#{cid} (T{cteam})"
+
+        _art_game_state.set_text(
+            f"{strength_str} {state_str}  {team_str}  ·  {side_str}  ·  {substate_str}\n"
+            f"ctrl: {ctrl_str}"
+        )
+    else:
+        _art_game_state.set_text("game state: —")
+
     # ── Blit ──────────────────────────────────────────────────────────────────
     fig.canvas.restore_region(_bg)
     for artist in [
@@ -465,7 +497,7 @@ def _redraw():
         _art_ally_main, *_art_ally_det, _art_ally_ball,
         *_art_walls,
         _art_pos_hist, _art_bot_hist,
-        _art_status,
+        _art_status, _art_game_state,
     ]:
         ax.draw_artist(artist)
     fig.canvas.blit(fig.bbox)
@@ -542,6 +574,9 @@ def on_update(key, value):
             elif key == "ball_raw":
                 _ball_raw = json.loads(value)
 
+            elif key == "field_sectors":
+                _field_sectors = json.loads(value)
+
             elif key == "ally_id":
                 try:
                     _ally_id = int(value) if value else None
@@ -579,6 +614,7 @@ if __name__ == "__main__":
         "ally_id":              lambda v: int(v) if v and v.strip() else None,
         "raw_robots":           lambda v: json.loads(v),
         "ball_raw":             lambda v: json.loads(v),
+        "field_sectors":        lambda v: json.loads(v),
     }
     _TARGETS = {
         "imu_pitch":            "_imu_pitch",
@@ -594,6 +630,7 @@ if __name__ == "__main__":
         "ally_id":              "_ally_id",
         "raw_robots":           "_raw_robots",
         "ball_raw":             "_ball_raw",
+        "field_sectors":        "_field_sectors",
     }
     for key, parse in _SEEDS.items():
         try:

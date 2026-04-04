@@ -281,6 +281,20 @@ def robot_in_file(robot_id, file):
 
 # ── Game state ────────────────────────────────────────────────────────────────
 
+def _ball_substate(dominant_team):
+    """'front' if ball moves toward dominant team's target goal, 'back' otherwise."""
+    if _ball is None or dominant_team is None:
+        return None
+    vy = _ball.get("vy")
+    if vy is None or vy == 0:
+        return None
+    # Team 0 attacks upward (toward team 1's top goal): front = vy > 0
+    # Team 1 attacks downward (toward team 0's bottom goal): front = vy < 0
+    if dominant_team == TEAM_US:
+        return "front" if vy > 0 else "back"
+    return "front" if vy < 0 else "back"
+
+
 def _ball_side():
     """Horizontal side of the ball: 'left', 'center', or 'right'. None if unknown."""
     bp = ball_pos()
@@ -375,6 +389,7 @@ def game_state():
         "strength": dominant_strength,
         "team":     dominant_team,
         "side":     _ball_side(),
+        "substate": _ball_substate(dominant_team),
         "team0":    s0,
         "team1":    s1,
     }
