@@ -21,9 +21,9 @@ TEAM_ENEMY = 1
 # The field is split into COLS × ROWS = 4 × 4 = 16 equal subdivisions.
 #
 #   row 3 │ (0,3) (1,3) (2,3) (3,3) │  ← team 0 attack / team 1 own half
-#   row 2 │ (0,2) (1,2) (2,2) (3,2) │  ← team 0 push
-#   row 1 │ (0,1) (1,1) (2,1) (3,1) │  ← team 1 push
-#   row 0 │ (0,0) (1,0) (2,0) (3,0) │  ← team 1 attack / team 0 own half
+#   row 2 │ (0,2) (1,2) (2,2) (3,2) │  ← team 0 push   / team 1 own half
+#   row 1 │ (0,1) (1,1) (2,1) (3,1) │  ← team 0 own half / team 1 push
+#   row 0 │ (0,0) (1,0) (2,0) (3,0) │  ← team 0 own half / team 1 attack
 #           col 0  col 1  col 2  col 3
 #
 # col  (0–3) : vertical strip, increases left → right
@@ -31,14 +31,83 @@ TEAM_ENEMY = 1
 # rank       : synonym for row  — "which horizontal band"
 # file       : synonym for col  — "which file band"
 #
-# ── Game-state zones ──────────────────────────────────────────────────────────
-# Team 1 advances downward toward team 0's goal:
-#   row 1 → push    row 0 → attack
-# Team 0 advances upward toward team 1's goal:
-#   row 2 → push    row 3 → attack
+# ── Game-state overview ───────────────────────────────────────────────────────
 #
-# strength: "weak" = 1 robot in zone, "strong" = 2+ robots in zone
-# side (ball's horizontal position): col 0 → "left", col 1–2 → "center", col 3 → "right"
+# The game state answers the question: "who is pressing, how hard, and where?"
+# It is evaluated independently for each team, then the more dangerous situation
+# is selected as the dominant state that is broadcast.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  STATE  — what kind of offensive action is taking place                 │
+# │                                                                         │
+# │  "push"   One or more robots of a team are in their push row (the row   │
+# │           adjacent to the opponent's half), AND the ball is anywhere    │
+# │           in the offensive half (push row or attack row).  The team is  │
+# │           applying pressure but has not yet fully entered the scoring   │
+# │           zone.                                                         │
+# │                                                                         │
+# │  "attack" One or more robots of a team are in their attack row (the     │
+# │           front-most row, directly in front of the opponent's goal),    │
+# │           AND the ball is also in that same attack row.  Attack always  │
+# │           takes priority over push: if robots are in both rows the      │
+# │           attack row wins, and if the ball has reached the attack row   │
+# │           it is never reported as a push even if push-row robots exist. │
+# │                                                                         │
+# │  None     No qualifying robots+ball combination detected.               │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │  STRENGTH — how many robots are committed to the zone                   │
+# │                                                                         │
+# │  "weak"   Exactly one robot in the relevant row.                        │
+# │  "strong" Two or more robots in the relevant row.                       │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │  TEAM — which team owns the dominant state (0 = us, 1 = enemy)         │
+# │                                                                         │
+# │  Scoring: attack=2, push=1; strong multiplier=2, weak=1.               │
+# │  The team with the higher score is dominant.  On a tie, team 0 wins.   │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │  SIDE — horizontal position of the ball                                 │
+# │                                                                         │
+# │  col 0        → "left"                                                  │
+# │  col 1 or 2   → "center"                                                │
+# │  col 3        → "right"                                                 │
+# │                                                                         │
+# │  Indicates which side of the field the ball is on, independently of    │
+# │  the state/team.  Useful for deciding which side to defend or attack.   │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │  SUBSTATE — ball movement relative to the dominant team's robots        │
+# │                                                                         │
+# │  "In front" means closer to the dominant team's goal along the attack   │
+# │  axis (higher y for team 0 / lower y for team 1).                       │
+# │                                                                         │
+# │  Ball moving TOWARD goal:                                               │
+# │    "shot"      Ball is in front of both robots — already past them,     │
+# │                heading straight for the goal.                           │
+# │    "frontpass" Ball is between the two robots — travelling in the       │
+# │                right direction through the formation.                   │
+# │    "catch"     Ball is behind both robots — approaching from behind,    │
+# │                robots need to turn or intercept.                        │
+# │                                                                         │
+# │  Ball moving AWAY from goal:                                            │
+# │    "miss"      Ball is in front of both robots — moving away from the   │
+# │                goal past the front of the formation (deflection / miss) │
+# │    "backpass"  Ball is between the two robots — moving backward through │
+# │                the formation (intentional or deflected back-pass).      │
+# │    "loss"      Ball is behind both robots — moving away from the goal   │
+# │                and behind the formation entirely (possession lost).     │
+# │                                                                         │
+# │  With only one robot tracked, "frontpass"/"backpass" cannot occur;      │
+# │  only the in-front / behind pair applies.                               │
+# │  None if ball velocity is zero/unknown or no team robots are tracked.  │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Zone map (y increases upward; team 0 attacks toward top):
+#
+#   ╔════════════════════╗   ← opponent's goal (team 1 defends)
+#   ║  row 3  [ATTACK T0]║
+#   ║  row 2  [PUSH   T0]║
+#   ║  row 1  [PUSH   T1]║
+#   ║  row 0  [ATTACK T1]║
+#   ╚════════════════════╝   ← own goal (team 0 defends)
 
 COLS = 4
 ROWS = 4
@@ -381,13 +450,20 @@ def _team_game_state(team):
     """
     Compute the offensive game-state for a single team.
 
-    Returns {"state": "push"|"attack", "strength": "weak"|"strong"} or None
-    if no qualifying condition is met.
+    Conditions (see the overview block at the top of this file for full detail):
+      attack — robots in the attack row AND ball in the attack row.
+      push   — robots in the push row AND ball anywhere in the offensive half
+               (push row OR attack row).
 
-    attack: robots in attack row AND ball in attack row.
-    push:   robots in push row AND ball in either offensive row (push or attack).
-    attack takes priority — if the ball is already in the attack row it is
-    never downgraded to a push.
+    Attack is evaluated first and takes unconditional priority: if the ball
+    has reached the attack row, the state is never reported as push regardless
+    of where the push-row robots are.
+
+    Strength is determined by how many robots are in the qualifying row:
+      1 robot  → "weak"
+      2+ robots → "strong"
+
+    Returns {"state": ..., "strength": ...} or None if no condition is met.
     """
     positions  = _team_positions(team)
     attack_row = _ATTACK_ROW[team]
@@ -399,15 +475,20 @@ def _team_game_state(team):
     in_attack = [p for p in positions if row_of(p["y"]) == attack_row]
     in_push   = [p for p in positions if row_of(p["y"]) == push_row]
 
+    # Attack requires the ball to have reached the front rank.
     if in_attack and ball_row == attack_row:
         return {"state": "attack", "strength": "strong" if len(in_attack) >= 2 else "weak"}
-    # Push covers both offensive ranks; attack rank takes priority above
+    # Push fires as long as the ball is anywhere in the offensive half (both
+    # offensive rows).  The attack check above ensures the attack row can never
+    # fall through to here while attack robots are also present.
     if in_push and ball_row in (push_row, attack_row):
         return {"state": "push",   "strength": "strong" if len(in_push)   >= 2 else "weak"}
     return None
 
 
 def _state_score(s):
+    # Numeric priority used to pick the dominant team.
+    # attack=2, push=1; strong doubles the score → range 0–4.
     if s is None:
         return 0
     return (2 if s["state"] == "attack" else 1) * (2 if s["strength"] == "strong" else 1)
@@ -416,6 +497,10 @@ def _state_score(s):
 def game_state():
     """
     Return the dominant game state across both teams.
+
+    Both teams are evaluated independently, then the more dangerous situation
+    (higher _state_score) is selected as the top-level dominant state.  On a
+    tie, team 0 (us) is considered dominant.
 
     Returns {
         "state":    "push" | "attack" | None,
@@ -427,19 +512,22 @@ def game_state():
         "team1":    {"state": ..., "strength": ...} | None,
     }
 
-    The top-level state/strength/team reflect whichever team has the more
-    dangerous situation (attack > push, strong > weak).  team0 and team1
-    contain the full per-team detail.
+    state / strength / team  — dominant situation (see overview block above).
+    side                     — horizontal band of the ball, independent of team.
+    substate                 — ball movement relative to dominant team's robots.
+    team0 / team1            — per-team detail for both teams simultaneously.
     """
     s0 = _team_game_state(TEAM_US)
     s1 = _team_game_state(TEAM_ENEMY)
     sc0, sc1 = _state_score(s0), _state_score(s1)
 
     if sc0 == 0 and sc1 == 0:
+        # Neither team is in an offensive zone — no meaningful state.
         dominant_state    = None
         dominant_strength = None
         dominant_team     = None
     elif sc0 >= sc1:
+        # Team 0 is at least as dangerous; also wins on a tie.
         dominant_state    = s0["state"]
         dominant_strength = s0["strength"]
         dominant_team     = TEAM_US
