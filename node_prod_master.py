@@ -3,6 +3,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "robus-core"))
 
 import json
+import random
+import threading
 import time
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
@@ -167,6 +169,22 @@ def ball_controlled():
     return on_ball() is not None
 
 
+# ── Strategy points ───────────────────────────────────────────────────────────
+
+_N_STRATEGY_POINTS    = 5
+_STRATEGY_INTERVAL    = 5.0   # seconds between updates
+
+def _strategy_loop():
+    while True:
+        points = [
+            {"x": round(random.uniform(0.0, FIELD_WIDTH),  3),
+             "y": round(random.uniform(0.0, FIELD_HEIGHT), 3)}
+            for _ in range(_N_STRATEGY_POINTS)
+        ]
+        mb.set("robot_strategy_points", json.dumps(points))
+        time.sleep(_STRATEGY_INTERVAL)
+
+
 # ── Broker publish ────────────────────────────────────────────────────────────
 
 def _publish(now):
@@ -235,6 +253,7 @@ if __name__ == "__main__":
             pass
 
     mb.setcallback(["robot_position", "other_robots", "ball", "ally_id"], on_update)
+    threading.Thread(target=_strategy_loop, daemon=True, name="strategy").start()
     print("[MASTER] Starting master node...")
     try:
         mb.receiver_loop()

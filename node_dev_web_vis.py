@@ -48,6 +48,7 @@ _ally_pos_raw         = {}
 _raw_robots           = None
 _ball_raw             = None
 _field_sectors        = None
+_strategy_points      = []
 
 # ── SSE push ──────────────────────────────────────────────────────────────────
 _push_cond = threading.Condition()
@@ -82,6 +83,7 @@ def _build_state():
         "ball_raw":             _ball_raw,
         "field_sectors":        _field_sectors,
         "ally_pos_raw":         _ally_pos_raw,
+        "strategy_points":      _strategy_points,
     })
 
 # ── HTML page (served once; all rendering is client-side) ─────────────────────
@@ -467,6 +469,35 @@ function drawStatus(s) {
     lines.forEach((l, i) => ctx.fillText(l, 5 + pad, 5 + pad + i * lh));
 }
 
+// ── Strategy points ───────────────────────────────────────────────────────────
+function drawStrategyPoints(s) {
+    const pts = s.strategy_points;
+    if (!pts || pts.length === 0) return;
+    const EDGE = '#22aa22';
+    const FACE = 'rgba(136,221,136,0.85)';
+    const r = sc(0.025);
+    // Connecting lines
+    if (pts.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(cx(pts[0].x), cy(pts[0].y));
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(cx(pts[i].x), cy(pts[i].y));
+        ctx.strokeStyle = EDGE;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([]);
+        ctx.stroke();
+    }
+    // Circles
+    for (const p of pts) {
+        ctx.beginPath();
+        ctx.arc(cx(p.x), cy(p.y), r, 0, 2 * Math.PI);
+        ctx.fillStyle = FACE;
+        ctx.fill();
+        ctx.strokeStyle = EDGE;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+    }
+}
+
 // ── Game state HTML panel ─────────────────────────────────────────────────────
 const gsEl = document.getElementById('gs');
 function updateGameState(s) {
@@ -498,6 +529,7 @@ function render(s) {
     drawRobotHistory(s);
     drawTrail(s.ball_history,         sc(0.014), '255,140,0',  0.7);
 
+    drawStrategyPoints(s);
     drawRawDetections(s);
     drawAllyMarkers(s);
     drawOtherRobots(s);
@@ -603,7 +635,7 @@ def on_update(key, value):
     global _robot_pos, _other_robots, _walls
     global _position_history, _other_robots_history
     global _ball_pos, _ball_hidden_pos, _ball_lost, _ball_vx, _ball_vy, _ball_history
-    global _ally_id, _ally_pos_raw, _raw_robots, _ball_raw, _field_sectors
+    global _ally_id, _ally_pos_raw, _raw_robots, _ball_raw, _field_sectors, _strategy_points
 
     if value is None:
         return
@@ -653,6 +685,8 @@ def on_update(key, value):
                 _ball_raw = json.loads(value)
             elif key == "field_sectors":
                 _field_sectors = json.loads(value)
+            elif key == "robot_strategy_points":
+                _strategy_points = json.loads(value)
             elif key == "ally_id":
                 try:
                     _ally_id = int(value) if value else None
@@ -691,22 +725,24 @@ if __name__ == "__main__":
         "ally_id":              lambda v: int(v) if v and v.strip() else None,
         "raw_robots":           lambda v: json.loads(v),
         "ball_raw":             lambda v: json.loads(v),
-        "field_sectors":        lambda v: json.loads(v),
+        "field_sectors":           lambda v: json.loads(v),
+        "robot_strategy_points":   lambda v: json.loads(v),
     }
     _TARGETS = {
-        "imu_pitch":            "_imu_pitch",
-        "lidar":                "_lidar",
-        "robot_position":       "_robot_pos",
-        "other_robots":         "_other_robots",
-        "lidar_walls":          "_walls",
-        "position_history":     "_position_history",
-        "other_robots_history": "_other_robots_history",
-        "ball":                 "_ball_pos",
-        "ball_history":         "_ball_history",
-        "ally_id":              "_ally_id",
-        "raw_robots":           "_raw_robots",
-        "ball_raw":             "_ball_raw",
-        "field_sectors":        "_field_sectors",
+        "imu_pitch":               "_imu_pitch",
+        "lidar":                   "_lidar",
+        "robot_position":          "_robot_pos",
+        "other_robots":            "_other_robots",
+        "lidar_walls":             "_walls",
+        "position_history":        "_position_history",
+        "other_robots_history":    "_other_robots_history",
+        "ball":                    "_ball_pos",
+        "ball_history":            "_ball_history",
+        "ally_id":                 "_ally_id",
+        "raw_robots":              "_raw_robots",
+        "ball_raw":                "_ball_raw",
+        "field_sectors":           "_field_sectors",
+        "robot_strategy_points":   "_strategy_points",
     }
     for key, parse in _SEEDS.items():
         try:
@@ -718,7 +754,7 @@ if __name__ == "__main__":
 
     _ally_keys = ["ally_main_robot_pos", "ally_other_pos_1",
                   "ally_other_pos_2", "ally_other_pos_3", "ally_ball_pos"]
-    mb.setcallback(list(_SEEDS.keys()) + _ally_keys, on_update)
+    mb.setcallback(list(_SEEDS.keys()) + _ally_keys + ["robot_strategy_points"], on_update)
 
     threading.Thread(target=mb.receiver_loop, daemon=True, name="broker").start()
 
