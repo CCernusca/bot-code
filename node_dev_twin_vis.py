@@ -461,17 +461,14 @@ def _redraw():
         f"walls={len(_walls)}  bots={len(_other_robots)}"
     )
 
-    # ── Game state text ───────────────────────────────────────────────────────
+    # ── Ball control text ─────────────────────────────────────────────────────
     if _field_sectors is not None:
-        gs   = _field_sectors.get("game_state") or {}
-        ctrl = _field_sectors.get("ball_control")
+        ctrl      = _field_sectors.get("ball_control")
+        ctrl_team = _field_sectors.get("controlling_team")
+        bp        = _field_sectors.get("ball")
 
-        state_str    = gs.get("state")    or "—"
-        strength_str = gs.get("strength") or ""
-        team_val     = gs.get("team")
-        side_str     = gs.get("side")     or "—"
-        substate_str = gs.get("substate") or "—"
-        team_str     = f"T{team_val}" if team_val is not None else "—"
+        ball_str = f"({bp['x']:.2f}, {bp['y']:.2f})" if bp else "—"
+        team_str = f"T{ctrl_team}" if ctrl_team is not None else "—"
 
         ctrl_str = "none"
         if ctrl is not None:
@@ -480,11 +477,11 @@ def _redraw():
             ctrl_str = f"self (T{cteam})" if cid is None else f"#{cid} (T{cteam})"
 
         _art_game_state.set_text(
-            f"{strength_str} {state_str}  {team_str}  ·  {side_str}  ·  {substate_str}\n"
-            f"ctrl: {ctrl_str}"
+            f"ball: {ball_str}\n"
+            f"ctrl: {ctrl_str}  [{team_str}]"
         )
     else:
-        _art_game_state.set_text("game state: —")
+        _art_game_state.set_text("ball: —")
 
     # ── Blit ──────────────────────────────────────────────────────────────────
     fig.canvas.restore_region(_bg)

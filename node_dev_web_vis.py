@@ -470,20 +470,20 @@ function drawStatus(s) {
 // ── Game state HTML panel ─────────────────────────────────────────────────────
 const gsEl = document.getElementById('gs');
 function updateGameState(s) {
-    if (!s.field_sectors) { gsEl.textContent = 'game state: —'; return; }
-    const gs   = s.field_sectors.game_state || {};
-    const ctrl = s.field_sectors.ball_control;
-    const state    = gs.state    || '—';
-    const strength = gs.strength || '';
-    const team     = gs.team != null ? `T${gs.team}` : '—';
-    const side     = gs.side     || '—';
-    const sub      = gs.substate || '—';
+    if (!s.field_sectors) { gsEl.textContent = 'ball: —'; return; }
+    const ctrl     = s.field_sectors.ball_control;
+    const ctrlTeam = s.field_sectors.controlling_team;
+    const bp       = s.field_sectors.ball;
+
+    const ballStr = bp ? `(${bp.x.toFixed(2)}, ${bp.y.toFixed(2)})` : '—';
+    const teamStr = ctrlTeam != null ? `T${ctrlTeam}` : '—';
+
     let ctrlStr = 'none';
     if (ctrl) {
         const cid = ctrl.id, ct = ctrl.team;
         ctrlStr = cid == null ? `self (T${ct})` : `#${cid} (T${ct})`;
     }
-    gsEl.textContent = `${strength} ${state}  ${team}  ·  ${side}  ·  ${sub}\nctrl: ${ctrlStr}`;
+    gsEl.textContent = `ball: ${ballStr}\nctrl: ${ctrlStr}  [${teamStr}]`;
 }
 
 // ── Main render ───────────────────────────────────────────────────────────────
