@@ -6,15 +6,20 @@ import numpy as np
 import threading
 import time
 
-# ── Camera specifications (Raspberry Pi Cam V2) ────────────────────────────────
-FOV_DEG    = 62.2
-RES_WIDTH  = 160   # <--- NEU: Ultra-Low-Res (Spart massiv CPU!)
-RES_HEIGHT = 120   # <--- NEU: Ultra-Low-Res
+# ── Camera specifications (Raspberry Pi Camera V2 / Webcam) ──────────────────
+FOV_DEG    = 62.2   # Horizontaler Blickwinkel der Pi Camera V2 (62.2°) - (Für Webcam auf 52.0 ändern)
+RES_WIDTH  = 160    # Native 4:3 Format für maximale CPU-Schonung auf RPi Zero
+RES_HEIGHT = 120    # 160x120 ist sehr schnell zu verarbeiten
 CENTER_X   = RES_WIDTH / 2.0
 
+# ── Image Masking (Zuschauer-Zensur) ───────────────────────────────────────────
+# Da das Bild 120 Pixel hoch ist, schneiden wir z.B. die obersten 30 Pixel ab.
+# Alles in diesem Bereich wird komplett schwarz und vom Filter ignoriert.
+CENSOR_TOP_HEIGHT_PX = 30  
+
 # ── Colour filter (HSV) ────────────────────────────────────────────────────────
-LOWER_ORANGE = (2, 66, 242)
-UPPER_ORANGE = (43, 123, 255)
+LOWER_ORANGE = (5, 31, 166)
+UPPER_ORANGE = (19, 151, 255)
 
 # ── Detection thresholds ───────────────────────────────────────────────────────
 DEADZONE_PIXELS = 10  # Toleranz-Bereich für "FORWARD" in der Mitte
@@ -33,30 +38,17 @@ FIELD_HEIGHT = 2.43
 # ── Broker key ────────────────────────────────────────────────────────────────
 BROKER_KEY = "ball_raw"
 
-SIM_REPLACE = True  # Auf False gesetzt, damit du direkt deine Pi Camera V2 nutzen kannst!
+SIM_REPLACE = True  # Auf False setzen, wenn echte Kamera genutzt wird
 
 # ── ADAPTIVE EXPONENTIAL MOVING AVERAGE (AEMA) SETUP ──────────────────────────
-# Dies ist ein effizienter 1D-Kalman-ähnlicher Filter für RPi Zero
-# Er passt die Glättung einstellbar an die Bewegungsgeschwindigkeit an:
-# - Bei kleinen Änderungen (Rauschen): Alpha ≈ 0.1 (starke Glättung)
-# - Bei großen Änderungen (echte Bewegung): Alpha ≈ 0.5 (schnelle Reaktion)
-
-_aema_dist = None      # Current estimate für Distanz
-_aema_angle = None     # Current estimate für Winkel
-_aema_x = None         # Current estimate für X-Position
-_aema_radius = None    # Current estimate für Radius
-
-# AEMA Parameter
 AEMA_ALPHA_MIN = 0.08  # Minimale Glättung (bei Rauschen)
 AEMA_ALPHA_MAX = 0.5   # Maximale Reaktion (bei schneller Bewegung)
 AEMA_THRESHOLD = 0.15  # Schwelle zur Aktivierung von Alpha_max (proportional zur Änderung)
-
 
 class AdaptiveEMA:
     """
     Lightweight adaptive Exponential Moving Average Filter.
     Reagiert schnell auf echte Bewegungen, glättet aber aggressiv bei Rauschen.
-    CPU-Kosten: ~5 Multiplikationen + 3 Vergleiche pro Frame (sehr effizient).
     """
     def __init__(self, alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD):
         self.alpha_min = alpha_min
@@ -65,35 +57,32 @@ class AdaptiveEMA:
         self.estimate = None
     
     def update(self, measurement):
-        """Update filter with new measurement. Returns smoothed estimate."""
         if self.estimate is None:
-            # Erste Messung: Initialisiere mit dem Messwert
             self.estimate = measurement
             return measurement
         
-        # Berechne relative Änderung (normalisiert auf Prozentanteil)
         if abs(self.estimate) > 1e-6:
             relative_change = abs(measurement - self.estimate) / abs(self.estimate)
         else:
             relative_change = abs(measurement - self.estimate)
         
-        # Adaptive Alpha: große Sprünge = schnäller Filter, kleine Sprünge = starke Glättung
         if relative_change > self.threshold:
-            alpha = self.alpha_max  # Schnelle Reaktion auf echte Bewegung
+            alpha = self.alpha_max  
         else:
-            alpha = self.alpha_min  # Starke Glättung bei Rauschen
+            alpha = self.alpha_min  
         
-        # Exponential Moving Average Update (sehr effizient)
         self.estimate = alpha * measurement + (1.0 - alpha) * self.estimate
         return self.estimate
     
     def reset(self):
-        """Reset filter state when ball leaves FOV."""
         self.estimate = None
 
+_aema_dist = AdaptiveEMA()
+_aema_angle = AdaptiveEMA()
+_aema_x = AdaptiveEMA()
+_aema_radius = AdaptiveEMA()
 
 def _reset_filters():
-    """Löscht die AEMA-Filter, wenn der Ball das Sichtfeld verlässt."""
     global _aema_dist, _aema_angle, _aema_x, _aema_radius
     _aema_dist.reset()
     _aema_angle.reset()
@@ -108,12 +97,6 @@ _robot_pos = None
 _imu_pitch = None
 _sim_state = None
 
-# Initialisiere AEMA Filter (global)
-_aema_dist = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
-_aema_angle = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
-_aema_x = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
-_aema_radius = AdaptiveEMA(alpha_min=AEMA_ALPHA_MIN, alpha_max=AEMA_ALPHA_MAX, threshold=AEMA_THRESHOLD)
-
 _hw_available = False
 try:
     import cv2
@@ -125,14 +108,20 @@ except ImportError as e:
 def _process_frame(frame):
     """
     Verarbeitet Frame mit HSV-Filterung und Konturerkennung.
-    Optimiert für 160x120 Auflösung und Pi Camera V2.
     """
+    # ════════════════════════════════════════════════════════════════════
+    # 🚫 ZUSCHAUER-ZENSUR (BLACK CENSOR)
+    # Schwärzt den oberen Rand des Bildes, um bunte T-Shirts zu ignorieren
+    # Numpy Slicing kostet fast 0 CPU Leistung!
+    # ════════════════════════════════════════════════════════════════════
+    if CENSOR_TOP_HEIGHT_PX > 0:
+        frame[0:CENSOR_TOP_HEIGHT_PX, :] = (0, 0, 0)
+
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv,
                        np.array(LOWER_ORANGE),
                        np.array(UPPER_ORANGE))
 
-    # Nur 1 Iteration bei 160x120, sonst löschen wir den Ball versehentlich!
     mask = cv2.erode(mask,  None, iterations=1) 
     mask = cv2.dilate(mask, None, iterations=1)
 
@@ -150,7 +139,7 @@ def _process_frame(frame):
         return {"command": "NO_BALL", "distance_cm": 0.0,
                 "angle_deg": 0.0, "x_center": -1, "radius": -1}
 
-    # --- DIE MATHEMATIK (Angepasst für 62.2° FOV der Pi Camera V2) ---
+    # --- DIE MATHEMATIK ---
     diameter_px = radius * 2.0
     Ow_deg = (FOV_DEG / RES_WIDTH) * diameter_px
     Ow_rad = math.radians(Ow_deg)
@@ -357,7 +346,7 @@ if __name__ == "__main__":
     threading.Thread(target=mb.receiver_loop, daemon=True,
                      name="broker-receiver").start()
 
-    print("[VISION] Starting headless vision system for Raspberry Pi Camera V2...")
+    print("[VISION] Starting headless vision system...")
 
     if SIM_REPLACE:
         cap = None
@@ -365,12 +354,13 @@ if __name__ == "__main__":
         print("[VISION] SIM_REPLACE=True — using simulated ball.")
     else:
         cap = cv2.VideoCapture(0)
+        
+        # Kamera-Wünsche setzen
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  RES_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES_HEIGHT)
 
         if cap.isOpened():
-            print(f"[VISION] Camera opened ({RES_WIDTH}x{RES_HEIGHT}). "
-                  "Running detection loop (Ctrl+C to stop)...")
+            print(f"[VISION] Camera opened. Running detection loop (Ctrl+C to stop)...")
             sim = None
         else:
             cap.release()
@@ -378,8 +368,7 @@ if __name__ == "__main__":
             sim = _SimBall()
             print("[VISION] Camera not available — falling back to simulated ball.")
 
-    print(f"[VISION] Using Raspberry Pi Camera V2 (FOV={FOV_DEG}° @ {RES_WIDTH}x{RES_HEIGHT})")
-    print(f"[VISION] Smoothing: Adaptive EMA (Alpha_min={AEMA_ALPHA_MIN}, Alpha_max={AEMA_ALPHA_MAX}, Threshold={AEMA_THRESHOLD})")
+    print(f"[VISION] Censor Box Active: Top {CENSOR_TOP_HEIGHT_PX} pixels will be ignored.")
     last_log_time = time.time()
 
     try:
@@ -391,31 +380,25 @@ if __name__ == "__main__":
                 if not ret:
                     print("[VISION] ERROR: Camera connection lost!")
                     break
-                
-                # ---> DIESE ZEILE HAT CLAUDE VERGESSEN! <---
-                # Wir zwingen das Bild der Webcam gnadenlos auf 160x120!
+
+                # 🚀 WICHTIG: Das Bild sofort und gnadenlos auf unsere Wunschauflösung zwingen!
                 frame = cv2.resize(frame, (RES_WIDTH, RES_HEIGHT), interpolation=cv2.INTER_NEAREST)
 
             with _perf.measure("frame"):
                 result = _process_frame(frame)
 
                 if result["command"] != "NO_BALL":
-                    # Raw messwerte vom Detektor
                     raw_dist = result["distance_cm"]
                     raw_angle = result["angle_deg"]
                     raw_x = result["x_center"]
                     raw_rad = result["radius"]
 
-                    # ════════════════════════════════════════════════════════════════════
-                    # ADAPTIVE EXPONENTIAL MOVING AVERAGE (AEMA)
-                    # Intelligente Glättung: schnell bei Bewegung, stark glatt bei Rauschen
-                    # ════════════════════════════════════════════════════════════════════
+                    # AEMA Glättung anwenden
                     result["distance_cm"] = round(_aema_dist.update(raw_dist), 1)
                     result["angle_deg"]   = round(_aema_angle.update(raw_angle), 1)
                     result["x_center"]    = round(_aema_x.update(raw_x), 1)
                     result["radius"]      = round(_aema_radius.update(raw_rad), 1)
 
-                    # 4. COMPUTE STEERING COMMAND BASED ON SMOOTHED X
                     error_x = result["x_center"] - CENTER_X
                     if error_x < -DEADZONE_PIXELS:
                         result["command"] = "LEFT"
@@ -437,7 +420,7 @@ if __name__ == "__main__":
                     result["sim_pos"] = sim.pos
                 mb.set(BROKER_KEY, json.dumps(result))
 
-            # Logging (every 1 second)
+            # Logging
             now = time.time()
             if now - last_log_time >= 1.0:
                 if result["command"] == "NO_BALL":
