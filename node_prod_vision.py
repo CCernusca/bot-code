@@ -145,6 +145,9 @@ class _SimBall:
     MARGIN   = BALL_R + 0.02
     SPEED    = 0.6
 
+    CAPTURE_DURATION = 10.0   # seconds the ball stays locked to the robot
+    CAPTURE_CHANCE   = 0.5    # probability of capture on collision
+
     def __init__(self):
         import random
         self._focal_px = (RES_WIDTH / 2.0) / math.tan(math.radians(FOV_DEG / 2.0))
@@ -156,6 +159,9 @@ class _SimBall:
         _hsv = np.array([[[15, 200, 220]]], dtype=np.uint8)
         bgr  = cv2.cvtColor(_hsv, cv2.COLOR_HSV2BGR)[0, 0]
         self._orange_bgr = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+        self._captured_robot_idx = None   # index into _all_robots()
+        self._captured_offset    = (0.0, 0.0)
+        self._capture_end_t      = 0.0
 
     def _all_robots(self):
         state = _sim_state
@@ -193,6 +199,7 @@ class _SimBall:
         return False
 
     def render(self):
+        import random
         now = time.monotonic()
         dt  = now - self._last_t
         self._last_t = now

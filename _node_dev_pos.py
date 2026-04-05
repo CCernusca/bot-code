@@ -5,8 +5,8 @@ import math
 import numpy as np
 
 # ── Field configuration ────────────────────────────────────────────────────────
-FIELD_WIDTH  = 1.82   # metres, X axis
-FIELD_HEIGHT = 2.43   # metres, Y axis
+FIELD_WIDTH  = 1.58   # metres, X axis — playing field only
+FIELD_HEIGHT = 2.19   # metres, Y axis
 ROBOT_RADIUS = 0.09   # metres
 
 # Tolerance for the valid-position bounds check.
@@ -20,7 +20,7 @@ DEBUG = False   # set True to print per-update positioning details
 # ──────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_pos", broker=mb)
+_perf = PerfMonitor("node_dev_pos", broker=mb)
 
 _imu_pitch   = None   # degrees — from imu_pitch broker key
 _lidar       = {}     # {angle_deg: dist_mm}
@@ -70,24 +70,25 @@ def _compute_position():
         gradient = wall.get("gradient")
         offset   = float(wall.get("offset", 0.0))
 
+        _OM = 0.12   # outer margin
         if gradient is None:  # vertical wall → constrains x
-            for rx in (-offset, FIELD_WIDTH - offset):
+            for rx in (-_OM - offset, FIELD_WIDTH + _OM - offset):
                 if not (ROBOT_RADIUS - _MARGIN <= rx <= FIELD_WIDTH - ROBOT_RADIUS + _MARGIN):
                     continue
                 if _lidar and not (
-                    rx + lidar_min_x >= -_LIDAR_FIELD_TOL and
-                    rx + lidar_max_x <= FIELD_WIDTH + _LIDAR_FIELD_TOL
+                    rx + lidar_min_x >= -_OM - _LIDAR_FIELD_TOL and
+                    rx + lidar_max_x <= FIELD_WIDTH + _OM + _LIDAR_FIELD_TOL
                 ):
                     continue
                 x_candidates.append(rx)
 
         else:  # horizontal wall → constrains y
-            for ry in (-offset, FIELD_HEIGHT - offset):
+            for ry in (-_OM - offset, FIELD_HEIGHT + _OM - offset):
                 if not (ROBOT_RADIUS - _MARGIN <= ry <= FIELD_HEIGHT - ROBOT_RADIUS + _MARGIN):
                     continue
                 if _lidar and not (
-                    ry + lidar_min_y >= -_LIDAR_FIELD_TOL and
-                    ry + lidar_max_y <= FIELD_HEIGHT + _LIDAR_FIELD_TOL
+                    ry + lidar_min_y >= -_OM - _LIDAR_FIELD_TOL and
+                    ry + lidar_max_y <= FIELD_HEIGHT + _OM + _LIDAR_FIELD_TOL
                 ):
                     continue
                 y_candidates.append(ry)

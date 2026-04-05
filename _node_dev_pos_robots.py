@@ -6,8 +6,8 @@ import time
 import numpy as np
 
 # ── Field & detection configuration ──────────────────────────────────────────
-FIELD_WIDTH  = 1.82   # metres, X axis
-FIELD_HEIGHT = 2.43   # metres, Y axis
+FIELD_WIDTH  = 1.58   # metres, X axis — playing field only
+FIELD_HEIGHT = 2.19   # metres, Y axis
 ROBOT_RADIUS = 0.09   # metres — assumed radius of all robots
 ROBOT_DIAMETER = ROBOT_RADIUS * 2
 
@@ -37,7 +37,7 @@ DEBUG = False   # set True to print per-scan detection results
 # ─────────────────────────────────────────────────────────────────────────────
 
 mb    = TelemetryBroker()
-_perf = PerfMonitor("node_pos_robots", broker=mb)
+_perf = PerfMonitor("node_dev_pos_robots", broker=mb)
 
 _lidar     = {}   # {angle_deg (int): dist_mm (int)}
 _robot_pos = None # (x, y) metres, in field frame

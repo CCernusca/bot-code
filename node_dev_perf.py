@@ -8,21 +8,25 @@ import threading
 REFRESH_HZ = 4   # display refresh rate
 
 PERF_NODES = [
-    # ── Individual nodes ──────────────────────────────────────────────────────
-    "node_imu",
-    "node_lidar",
-    "node_pos_walls",
-    "node_pos",
-    "node_pos_robots",
-    "node_predict_robots",
-    "node_predict_ball",
-    "node_vision",
-    "node_twin_vis",
     # ── Production (combined) nodes ───────────────────────────────────────────
     "node_prod_sensor",
     "node_prod_positioning",
     "node_prod_prediction",
     "node_prod_vision",
+    "node_prod_communication",
+    "node_prod_master",
+    # ── Individual (dev) nodes ────────────────────────────────────────────────
+    "node_dev_imu",
+    "node_dev_lidar",
+    "node_dev_pos_walls",
+    "node_dev_pos",
+    "node_dev_pos_robots",
+    "node_dev_predict_robots",
+    "node_dev_predict_ball",
+    "node_dev_vision",
+    "node_dev_twin_vis",
+    "node_dev_time",
+    "node_dev_bus_display",
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -45,7 +49,7 @@ HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
 HOME        = "\033[H"
 
-_COL_NODE = 20
+_COL_NODE = 30
 _COL_KEY  = 18
 _COL_VAL  =  9   # width of the bare number field (e.g. "  123.4ms")
 _SEP_W    = _COL_NODE + _COL_KEY + (_COL_VAL + 2) * 2 + 10
@@ -81,7 +85,7 @@ def _render() -> str:
         for node in PERF_NODES:
             keys = _state.get(node)
             if not keys:
-                rows += f"{_DIM}{node:<{_COL_NODE}}{'no data':<{_COL_KEY}}{_RESET}\n"
+                rows += f"{_DIM}{node:<{_COL_NODE}}{'no data                                                  ':<{_COL_KEY}}{_RESET}\n"
                 continue
             for i, (key, stats) in enumerate(sorted(keys.items())):
                 node_label = node if i == 0 else ""

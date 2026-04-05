@@ -7,8 +7,8 @@ import time
 import numpy as np
 
 # ── Field dimensions ──────────────────────────────────────────────────────────
-FIELD_WIDTH  = 1.82   # metres
-FIELD_HEIGHT = 2.43
+FIELD_WIDTH  = 1.58   # metres — playing field only
+FIELD_HEIGHT = 2.19
 ROBOT_RADIUS = 0.09
 
 # ── Robot dead-reckoning ──────────────────────────────────────────────────────
@@ -22,6 +22,8 @@ BALL_VEL_HISTORY_N   = 10
 BALL_VEL_HISTORY_MIN = 3
 BALL_VEL_MIN_DT      = 0.05   # seconds
 MAX_BALL_SPEED       = 3.0    # m/s
+MAX_ALLY_BALL_AGE    = 0.5    # seconds — ignore ally ball data older than this
+BALL_CAPTURE_DIST    = 0.15   # metres — ball this close to a robot is considered held
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -37,15 +39,22 @@ _sim_state = None
 _robot_last = {}   # id → {"x", "y", "vx", "vy", "t"}
 
 # ── Ball prediction state ─────────────────────────────────────────────────────
-_vel_history      = deque(maxlen=BALL_VEL_HISTORY_N)
+_vel_history       = deque(maxlen=BALL_VEL_HISTORY_N)
 _vel_history_dirty = False   # True when a new sample was appended since last fit
-_vel_last_t       = -999.0
-_last_detection_t = -999.0
-_last_ball_vx     = 0.0
-_last_ball_vy     = 0.0
-_hidden_state     = None
-_hidden_state_t   = None
-_ball_lost        = False
+_vel_last_t        = -999.0
+_last_detection_t  = -999.0
+_last_ball_vx      = 0.0
+_last_ball_vy      = 0.0
+_hidden_state      = None
+_hidden_state_t    = None
+_ball_lost         = False
+_ball_captured_id     = None   # ID of the robot currently holding the ball, or None
+_ball_captured_offset = None   # (dx, dy) ball relative to that robot at moment of capture
+
+# ── Ally ball state ───────────────────────────────────────────────────────────
+_ally_ball_pos  = None   # ally's detected ball {"x","y","confidence"} or None
+_ally_ball_pred = None   # ally's predicted ball {"x","y","confidence"} or None
+_ally_ball_t    = 0.0    # monotonic time of last ally_data containing ball info
 
 
 # ── Robot dead-reckoning ──────────────────────────────────────────────────────
@@ -153,6 +162,8 @@ def on_update(key, value):
     global _vel_history, _vel_history_dirty, _vel_last_t, _last_detection_t
     global _last_ball_vx, _last_ball_vy
     global _hidden_state, _hidden_state_t, _ball_lost
+    global _ball_captured_id, _ball_captured_offset
+    global _ally_ball_pos, _ally_ball_pred, _ally_ball_t
 
     if value is None:
         return
@@ -221,6 +232,17 @@ def on_update(key, value):
             mb.set("other_robots", json.dumps({"origin": origin, "robots": result}))
         return
 
+    if key == "ally_data":
+        try:
+            d = json.loads(value)
+            _ally_ball_pos  = d.get("ball_pos")
+            _ally_ball_pred = d.get("ball_pred")
+            if _ally_ball_pos is not None or _ally_ball_pred is not None:
+                _ally_ball_t = time.monotonic()
+        except Exception:
+            pass
+        return
+
     # ── Ball prediction ───────────────────────────────────────────────────────
     if key == "ball_raw":
         with _perf.measure("ball"):
@@ -229,27 +251,49 @@ def on_update(key, value):
             except Exception:
                 return
 
-            now_t  = time.monotonic()
-            gpos   = raw.get("global_pos")
+            now_t      = time.monotonic()
+            gpos       = raw.get("global_pos")
             hidden_pos = None
             pub_vx, pub_vy = _last_ball_vx, _last_ball_vy
 
-            if gpos is not None:
-                _last_detection_t = now_t
-                _ball_lost        = False
-                _hidden_state     = [gpos["x"], gpos["y"], _last_ball_vx, _last_ball_vy]
-                _hidden_state_t   = None
+            # ── Ally ball fusion ──────────────────────────────────────────
+            ally_fresh = (now_t - _ally_ball_t) < MAX_ALLY_BALL_AGE
+            best_pos   = gpos  # our raw detection (may be None)
+
+            if ally_fresh and _ally_ball_pos is not None:
+                aball = _ally_ball_pos
+                aconf = float(aball.get("confidence", 1.0))
+                if best_pos is not None:
+                    # Both sides see the ball: confidence-weighted fusion
+                    total    = 1.0 + aconf
+                    best_pos = {
+                        "x": (best_pos["x"] + aconf * aball["x"]) / total,
+                        "y": (best_pos["y"] + aconf * aball["y"]) / total,
+                    }
+                else:
+                    # Only the ally detects the ball: treat it as our own
+                    best_pos = {"x": aball["x"], "y": aball["y"]}
+
+            # ── Detection logic (uses best_pos) ──────────────────────────
+            if best_pos is not None:
+                _last_detection_t    = now_t
+                _ball_lost           = False
+                _ball_captured_id    = None   # ball is visible — release any capture
+                _ball_captured_offset = None
+                _hidden_state        = [best_pos["x"], best_pos["y"],
+                                        _last_ball_vx, _last_ball_vy]
+                _hidden_state_t      = None
 
                 if now_t - _vel_last_t >= BALL_VEL_MIN_DT:
                     ok = True
                     if _vel_history:
                         dt_s = now_t - _vel_history[-1][0]
-                        if math.hypot(gpos["x"] - _vel_history[-1][1],
-                                      gpos["y"] - _vel_history[-1][2]
+                        if math.hypot(best_pos["x"] - _vel_history[-1][1],
+                                      best_pos["y"] - _vel_history[-1][2]
                                       ) > MAX_BALL_SPEED * dt_s * 1.5:
                             ok = False
                     if ok:
-                        _vel_history.append((now_t, gpos["x"], gpos["y"]))  # deque: O(1), auto-truncates
+                        _vel_history.append((now_t, best_pos["x"], best_pos["y"]))
                         _vel_history_dirty = True
                     _vel_last_t = now_t
             else:
@@ -272,29 +316,73 @@ def on_update(key, value):
                     _hidden_state[3] = vy_fit
                 _vel_history_dirty = False
 
-            if gpos is None and _hidden_state is not None:
+            if best_pos is None and _hidden_state is not None:
                 if _ball_lost or _in_camera_fov(_hidden_state[0], _hidden_state[1]):
-                    _ball_lost = True
-                    pub_vx = pub_vy = 0.0
+                    # Ball is in FOV but not seen → truly lost, stop predicting
+                    _ball_lost        = True
+                    _ball_captured_id = None
+                    pub_vx = pub_vy   = 0.0
                 else:
-                    if _hidden_state_t is None:
-                        _hidden_state_t = now_t
-                    else:
-                        dt_frame = now_t - _hidden_state_t
-                        if dt_frame > 0:
-                            hx, hy, hvx, hvy = _extrapolate_ball(
-                                _hidden_state[0], _hidden_state[1],
-                                _hidden_state[2], _hidden_state[3],
-                                dt_frame, robots=_robot_positions_cache,
-                            )
-                            _hidden_state   = [hx, hy, hvx, hvy]
+                    # ── Capture detection (first frame of loss only) ───────
+                    if _hidden_state_t is None and _ball_captured_id is None:
+                        bx, by = _hidden_state[0], _hidden_state[1]
+                        best_rid, best_dist = None, BALL_CAPTURE_DIST + 1
+                        for rid, last in _robot_last.items():
+                            d = math.hypot(bx - last["x"], by - last["y"])
+                            if d < best_dist:
+                                best_dist, best_rid = d, rid
+                        if best_dist <= BALL_CAPTURE_DIST:
+                            _ball_captured_id     = best_rid
+                            last = _robot_last[best_rid]
+                            _ball_captured_offset = (bx - last["x"], by - last["y"])
+
+                    # ── Track captured ball with its robot ────────────────
+                    if _ball_captured_id is not None:
+                        last = _robot_last.get(_ball_captured_id)
+                        if last is not None:
+                            dt = now_t - last["t"]
+                            rx, ry = _predict_with_bounce(
+                                last["x"], last["y"], last["vx"], last["vy"], dt)
+                            hx = max(0.0, min(FIELD_WIDTH,  rx + _ball_captured_offset[0]))
+                            hy = max(0.0, min(FIELD_HEIGHT, ry + _ball_captured_offset[1]))
+                            _hidden_state = [hx, hy, last["vx"], last["vy"]]
+                            if _hidden_state_t is None:
+                                _hidden_state_t = now_t
+                            pub_vx, pub_vy = last["vx"], last["vy"]
+                        else:
+                            # Captured robot gone — release and fall through to physics
+                            _ball_captured_id     = None
+                            _ball_captured_offset = None
+
+                    # ── Physics extrapolation (no active capture) ─────────
+                    if _ball_captured_id is None:
+                        # Ally prediction can nudge hidden_state
+                        if ally_fresh and _ally_ball_pred is not None:
+                            ap = _ally_ball_pred
+                            _hidden_state[0] = (_hidden_state[0] + ap["x"]) / 2
+                            _hidden_state[1] = (_hidden_state[1] + ap["y"]) / 2
+                        if _hidden_state_t is None:
                             _hidden_state_t = now_t
-                    pub_vx = _hidden_state[2]
-                    pub_vy = _hidden_state[3]
+                        else:
+                            dt_frame = now_t - _hidden_state_t
+                            if dt_frame > 0:
+                                hx, hy, hvx, hvy = _extrapolate_ball(
+                                    _hidden_state[0], _hidden_state[1],
+                                    _hidden_state[2], _hidden_state[3],
+                                    dt_frame, robots=_robot_positions_cache,
+                                )
+                                _hidden_state   = [hx, hy, hvx, hvy]
+                                _hidden_state_t = now_t
+                        pub_vx = _hidden_state[2]
+                        pub_vy = _hidden_state[3]
+
                 hidden_pos = {"x": round(_hidden_state[0], 3),
                               "y": round(_hidden_state[1], 3)}
 
             result = dict(raw)
+            result["global_pos"] = ({"x": round(best_pos["x"], 4),
+                                     "y": round(best_pos["y"], 4)}
+                                    if best_pos is not None else None)
             result["vx"]         = round(pub_vx, 3)
             result["vy"]         = round(pub_vy, 3)
             result["hidden_pos"] = hidden_pos
@@ -320,7 +408,8 @@ if __name__ == "__main__":
     _rebuild_robot_positions_cache()
     print("[PREDICTION] Starting combined prediction node...")
     mb.setcallback(
-        ["ball_raw", "other_robots_detected", "robot_position", "imu_pitch", "sim_state"],
+        ["ball_raw", "other_robots_detected", "robot_position", "imu_pitch",
+         "sim_state", "ally_data"],
         on_update,
     )
     try:
