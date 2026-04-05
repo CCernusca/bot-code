@@ -722,7 +722,19 @@ if __name__ == "__main__":
 
     threading.Thread(target=mb.receiver_loop, daemon=True, name="broker").start()
 
-    print(f"[WEB-VIS] Serving at http://{HOST}:{PORT}/")
+    import socket
+    print(f"[WEB-VIS] Serving on port {PORT} — available at:")
+    try:
+        addrs = set()
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addr = info[4][0]
+            if not addr.startswith("127.") and not addr.startswith("::"):
+                addrs.add(addr)
+        addrs.add("127.0.0.1")
+        for addr in sorted(addrs):
+            print(f"  http://{addr}:{PORT}/")
+    except Exception:
+        print(f"  http://0.0.0.0:{PORT}/")
     class _Server(HTTPServer):
         def handle_error(self, request, client_address):
             import sys
