@@ -3,8 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "robus-core"))
 
 import json
-import random
-import threading
+import math
 import time
 from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
@@ -191,18 +190,87 @@ def ball_controlled():
 
 # ── Strategy points ───────────────────────────────────────────────────────────
 
-_N_STRATEGY_POINTS    = 5
-_STRATEGY_INTERVAL    = 5.0   # seconds between updates
+# Centre of our goal opening (bottom, y = 0)
+_OUR_GOAL = (FIELD_WIDTH / 2, 0.0)
 
-def _strategy_loop():
-    while True:
-        points = [
-            {"x": round(random.uniform(0.0, FIELD_WIDTH),  3),
-             "y": round(random.uniform(0.0, FIELD_HEIGHT), 3)}
-            for _ in range(_N_STRATEGY_POINTS)
-        ]
-        mb.set("robot_strategy_points", json.dumps(points))
-        time.sleep(_STRATEGY_INTERVAL)
+
+def _closest_on_segment(ax, ay, bx, by, px, py):
+    """Return the point on segment A→B that is closest to P."""
+    dx, dy = bx - ax, by - ay
+    lsq = dx * dx + dy * dy
+    if lsq < 1e-12:
+        return ax, ay
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / lsq))
+    return ax + t * dx, ay + t * dy
+
+
+def _dist_to_segment(ax, ay, bx, by, px, py):
+    cx, cy = _closest_on_segment(ax, ay, bx, by, px, py)
+    return math.hypot(px - cx, py - cy)
+
+
+def _compute_strategy_points(ctrl):
+    """Return the robot_strategy_points list for the current game state.
+
+    Only active when the enemy controls the ball.
+
+    The controlling enemy robot is always the last point (so the connecting
+    line shows the intercept direction).  The first point is the suggested
+    intercept position for our robot:
+
+      • If *we* (self) are closer to the line controlling-robot → our goal
+        than the ally is, we intercept that passing lane (block the shot).
+
+      • Otherwise the ally is already covering the goal line, so we cover the
+        pass to the next most dangerous enemy: the closest other enemy to the
+        controller.  Our intercept point is the foot of the perpendicular from
+        our position onto that passing lane.
+
+    Returns a list of {"x", "y"} dicts (0 or 2 entries).
+    """
+    if ctrl is None or ctrl.get("team") != TEAM_ENEMY:
+        return []
+
+    crx, cry = ctrl["x"], ctrl["y"]
+    gx, gy   = _OUR_GOAL
+
+    sp   = self_pos()
+    ally = next((r for r in all_robots() if r["team"] == TEAM_US), None)
+
+    d_self = (_dist_to_segment(crx, cry, gx, gy, sp["x"],   sp["y"])
+              if sp   else float("inf"))
+    d_ally = (_dist_to_segment(crx, cry, gx, gy, ally["x"], ally["y"])
+              if ally else float("inf"))
+
+    if d_self <= d_ally:
+        # We are the nearer defender on the goal line — mark that intercept
+        if sp:
+            ix, iy = _closest_on_segment(crx, cry, gx, gy, sp["x"], sp["y"])
+        else:
+            ix, iy = gx, gy
+    else:
+        # Ally covers the goal; we cover the pass to the next enemy
+        others = [r for r in all_robots()
+                  if r["team"] == TEAM_ENEMY and r["id"] != ctrl["id"]]
+        if not others:
+            # No second enemy — fall back to goal-line coverage
+            if sp:
+                ix, iy = _closest_on_segment(crx, cry, gx, gy, sp["x"], sp["y"])
+            else:
+                ix, iy = gx, gy
+        else:
+            # Intercept the pass lane to the closest other enemy
+            target = min(others, key=lambda r: math.hypot(r["x"] - crx, r["y"] - cry))
+            if sp:
+                ix, iy = _closest_on_segment(
+                    crx, cry, target["x"], target["y"], sp["x"], sp["y"])
+            else:
+                ix, iy = (crx + target["x"]) / 2, (cry + target["y"]) / 2
+
+    return [
+        {"x": round(ix,  3), "y": round(iy,  3)},
+        {"x": round(crx, 3), "y": round(cry, 3)},
+    ]
 
 
 # ── Broker publish ────────────────────────────────────────────────────────────
@@ -234,6 +302,7 @@ def _publish(now):
         state["controlling_team"] = controlling_team
 
     mb.set("field_sectors", json.dumps(state))
+    mb.set("robot_strategy_points", json.dumps(_compute_strategy_points(ctrl)))
 
 
 # ── Broker callbacks ──────────────────────────────────────────────────────────
@@ -273,7 +342,6 @@ if __name__ == "__main__":
             pass
 
     mb.setcallback(["robot_position", "other_robots", "ball", "ally_id"], on_update)
-    threading.Thread(target=_strategy_loop, daemon=True, name="strategy").start()
     print("[MASTER] Starting master node...")
     try:
         mb.receiver_loop()
