@@ -20,9 +20,10 @@ TEAM_US    = 0
 TEAM_ENEMY = 1
 
 # ── Ball control ──────────────────────────────────────────────────────────────
-ROBOT_RADIUS      = 0.09
-BALL_RADIUS       = 0.021
-BALL_CONTROL_DIST = ROBOT_RADIUS + BALL_RADIUS + 0.04   # ≈ 0.15 m
+ROBOT_RADIUS       = 0.09
+BALL_RADIUS        = 0.021
+BALL_CONTROL_DIST  = ROBOT_RADIUS + BALL_RADIUS + 0.10  # ≈ 0.21 m
+BALL_CONTROL_DWELL = 0.3   # seconds ball must stay in range to confirm control
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -107,13 +108,18 @@ def ball_pos():
 # Updated by on_ball() on every call.
 controlling_team = None
 
+# Per-robot dwell tracking: robot_key (id or None for self) → monotonic time
+# when the ball first entered BALL_CONTROL_DIST for that robot continuously.
+_control_first_seen = {}
+
 
 def _dist(ax, ay, bx, by):
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
 def on_ball(robot_id=None):
-    """Return the robot closest to the ball that is within BALL_CONTROL_DIST.
+    """Return the robot closest to the ball that is within BALL_CONTROL_DIST
+    and has kept the ball in range for at least BALL_CONTROL_DWELL seconds.
 
     Also updates the module-level `controlling_team` variable.
 
@@ -122,34 +128,48 @@ def on_ball(robot_id=None):
 
     Returns a dict {"id": int|None, "x", "y", "predicted", "team", "dist"}
     where id=None represents the own robot.  Returns None when no robot
-    is in ball-control range.
+    has confirmed control.
     """
-    global controlling_team
+    global controlling_team, _control_first_seen
 
     bp = ball_pos()
     if bp is None:
         controlling_team = None
+        _control_first_seen.clear()
         return None
 
-    candidates = []
+    now = time.monotonic()
 
+    # Build list of all robots currently within range
+    in_range = []
     sp = self_pos()
     if sp is not None:
         d = _dist(sp["x"], sp["y"], bp["x"], bp["y"])
         if d <= BALL_CONTROL_DIST:
-            candidates.append({"id": None, "x": sp["x"], "y": sp["y"],
-                                "predicted": False, "team": TEAM_US, "dist": d})
-
+            in_range.append({"id": None, "x": sp["x"], "y": sp["y"],
+                              "predicted": False, "team": TEAM_US, "dist": d})
     for r in all_robots():
         d = _dist(r["x"], r["y"], bp["x"], bp["y"])
         if d <= BALL_CONTROL_DIST:
-            candidates.append({**r, "dist": d})
+            in_range.append({**r, "dist": d})
 
-    if not candidates:
+    # Evict robots that left range; record first-seen for new entrants
+    in_range_keys = {c["id"] for c in in_range}
+    _control_first_seen = {k: v for k, v in _control_first_seen.items()
+                           if k in in_range_keys}
+    for c in in_range:
+        if c["id"] not in _control_first_seen:
+            _control_first_seen[c["id"]] = now
+
+    # Only robots that have dwelled long enough qualify
+    eligible = [c for c in in_range
+                if now - _control_first_seen[c["id"]] >= BALL_CONTROL_DWELL]
+
+    if not eligible:
         controlling_team = None
         return None
 
-    closest = min(candidates, key=lambda c: c["dist"])
+    closest = min(eligible, key=lambda c: c["dist"])
     controlling_team = closest["team"]
 
     if robot_id is not None:
