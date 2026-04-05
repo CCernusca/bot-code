@@ -195,7 +195,7 @@ _OUR_GOAL   = (FIELD_WIDTH / 2, 0.0)
 _ENEMY_GOAL = (FIELD_WIDTH / 2, FIELD_HEIGHT)
 
 _SHOOT_GRID_N = 15   # grid resolution for LOS search
-
+_MAX_RANGE = 0.5     # Maximum shooting distance
 
 def _closest_on_segment(ax, ay, bx, by, px, py):
     """Return the point on segment A→B that is closest to P."""
@@ -213,24 +213,52 @@ def _dist_to_segment(ax, ay, bx, by, px, py):
 
 
 def _find_shooting_position():
-    """Return the field position closest to the enemy goal that has a clear
-    line of sight to it (no robot within ROBOT_RADIUS of the path).
+    """Return the field position closest to us that has a clear
+    line of sight to the enemy goal (no robot within ROBOT_RADIUS of the path).
 
-    Searches a _SHOOT_GRID_N × _SHOOT_GRID_N grid sorted by distance to the
-    enemy goal, returning the first unblocked cell.  Returns None if every
+    Searches a _SHOOT_GRID_N × _SHOOT_GRID_N grid sorted by distance to us,
+    returning the first unblocked cell which has clear sight to the goal and ally.  Returns None if every
     cell is blocked.
     """
     gx, gy  = _ENEMY_GOAL
     robots  = all_robots()
     n       = _SHOOT_GRID_N
-    # Build candidates sorted closest-to-goal first
+    sp      = self_pos()
+    # Build candidates sorted closest-to-self first
     candidates = sorted(
         (((xi + 0.5) / n * FIELD_WIDTH, (yi + 0.5) / n * FIELD_HEIGHT)
          for xi in range(n) for yi in range(n)),
-        key=lambda p: math.hypot(p[0] - gx, p[1] - gy),
+        key=lambda p: math.hypot(p[0] - sp["x"], p[1] - sp["y"]),
     )
     for px, py in candidates:
-        if not any(_dist_to_segment(px, py, gx, gy, r["x"], r["y"]) < ROBOT_RADIUS
+        print(_dist(px, py, gx, gy))
+        if _dist(px, py, gx, gy) <= _MAX_RANGE and not any(_dist_to_segment(px, py, gx, gy, r["x"], r["y"]) < ROBOT_RADIUS
+                   for r in robots):
+            return px, py
+    return None
+
+
+def _find_passing_position():
+    """Return the field position closest to us that has a clear
+    line of sight to the enemy goal (no robot within ROBOT_RADIUS of the path).
+
+    Searches a _SHOOT_GRID_N × _SHOOT_GRID_N grid sorted by distance to us,
+    returning the first unblocked cell which has clear sight to the goal and ally.  Returns None if every
+    cell is blocked.
+    """
+    gx, gy  = _ENEMY_GOAL
+    robots  = all_robots()
+    n       = _SHOOT_GRID_N
+    sp      = self_pos()
+    ally    = next((r for r in all_robots() if r["team"] == TEAM_US), None)
+    # Build candidates sorted closest-to-self first
+    candidates = sorted(
+        (((xi + 0.5) / n * FIELD_WIDTH, (yi + 0.5) / n * FIELD_HEIGHT)
+         for xi in range(n) for yi in range(n)),
+        key=lambda p: math.hypot(p[0] - sp["x"], p[1] - sp["y"]),
+    )
+    for px, py in candidates:
+        if _dist(px, py, gx, gy) <= _MAX_RANGE and _dist(px, py, ally["x"], ally["y"]) <= _MAX_RANGE and not any(_dist_to_segment(px, py, gx, gy, r["x"], r["y"]) < ROBOT_RADIUS and _dist_to_segment(px, py, ally["x"], ally["y"], r["x"], r["y"]) < ROBOT_RADIUS
                    for r in robots):
             return px, py
     return None
@@ -263,11 +291,13 @@ def _compute_strategy_points(ctrl):
     if ctrl.get("team") == TEAM_US:
         if ctrl.get("id") is None:
             # We have the ball — point at enemy goal
-            gx, gy = _ENEMY_GOAL
-            return [{"x": round(gx, 3), "y": round(gy, 3)}]
+            pos = _find_shooting_position()
+            if pos is None:
+                return []
+            return [{"x": round(pos[0], 3), "y": round(pos[1], 3)}]
         else:
             # Ally has the ball — best open shooting position
-            pos = _find_shooting_position()
+            pos = _find_passing_position()
             if pos is None:
                 return []
             return [{"x": round(pos[0], 3), "y": round(pos[1], 3)}]

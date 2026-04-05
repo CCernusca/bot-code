@@ -476,11 +476,22 @@ function drawStrategyPoints(s) {
     const EDGE = '#22aa22';
     const FACE = 'rgba(136,221,136,0.85)';
     const r = sc(0.025);
-    // Connecting lines
-    if (pts.length >= 2) {
+    // Connecting lines (robot → points → ...)
+    if (pts.length >= 1) {
         ctx.beginPath();
-        ctx.moveTo(cx(pts[0].x), cy(pts[0].y));
-        for (let i = 1; i < pts.length; i++) ctx.lineTo(cx(pts[i].x), cy(pts[i].y));
+
+        // Start at robot if available
+        if (s.robot_pos) {
+            ctx.moveTo(cx(s.robot_pos[0]), cy(s.robot_pos[1]));
+        } else {
+            ctx.moveTo(cx(pts[0].x), cy(pts[0].y));
+        }
+
+        // Then go through all strategy points
+        for (let i = 0; i < pts.length; i++) {
+            ctx.lineTo(cx(pts[i].x), cy(pts[i].y));
+        }
+
         ctx.strokeStyle = EDGE;
         ctx.lineWidth = 1.5;
         ctx.setLineDash([]);
@@ -534,11 +545,11 @@ function render(s) {
     drawRobotHistory(s);
     drawTrail(s.ball_history,         sc(0.014), '255,140,0',  0.7);
 
-    drawStrategyPoints(s);
     drawRawDetections(s);
     drawAllyMarkers(s);
     drawOtherRobots(s);
     drawOwnRobot(s);
+    drawStrategyPoints(s);
     drawBall(s);
     drawStatus(s);
     updateGameState(s);

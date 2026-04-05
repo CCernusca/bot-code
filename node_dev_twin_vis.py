@@ -489,10 +489,11 @@ def _redraw():
         else:
             c.set_visible(False)
             lbl.set_visible(False)
-    if n >= 2:
+    if n >= 1:
+        pos = _robot_pos
         _art_strategy_line.set_data(
-            [p["x"] for p in _strategy_points],
-            [p["y"] for p in _strategy_points],
+            [pos[0]] + [p["x"] for p in _strategy_points],
+            [pos[1]] + [p["y"] for p in _strategy_points],
         )
     else:
         _art_strategy_line.set_data([], [])
@@ -530,8 +531,8 @@ def _redraw():
     fig.canvas.restore_region(_bg)
     for artist in [
         _art_lidar,
-        _art_strategy_line, *_art_strategy_pts, *_art_strategy_lbls,
         _art_self, *_art_bots, *_art_blbls,
+        _art_strategy_line, *_art_strategy_pts, *_art_strategy_lbls,
         _art_arrow,
         _art_ball, _art_ball_hidden, _art_ball_hist, _art_ball_arrow,
         _art_sim_ball, _art_sim_self, *_art_sim_obs,
