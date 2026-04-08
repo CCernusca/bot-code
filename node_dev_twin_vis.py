@@ -645,6 +645,12 @@ def on_update(key, value):
 
 
 if __name__ == "__main__":
+    import argparse, sys, os
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--no-output", action="store_true")
+    if _ap.parse_args().no_output:
+        sys.stdout = open(os.devnull, "w")
+
     _SEEDS = {
         "imu_pitch":            lambda v: float(v),
         "lidar":                lambda v: {int(k): int(x) for k, x in json.loads(v).items()},
