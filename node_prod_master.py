@@ -121,6 +121,16 @@ def ball_pos():
     }
 
 
+def self_pos():
+    """Own robot position, or None if unknown.
+
+    Returns {"x": float, "y": float}.
+    """
+    if _robot_pos is None:
+        return None
+    return {"x": float(_robot_pos["x"]), "y": float(_robot_pos["y"])}
+
+
 # ── Ball control ──────────────────────────────────────────────────────────────
 
 # The team that currently has the ball (TEAM_US, TEAM_ENEMY, or None).
