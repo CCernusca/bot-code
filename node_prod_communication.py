@@ -299,8 +299,14 @@ def on_update(key, value):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    for key in ("sim_state", "ball", "ball_lost", "robot_position", "other_robots",
-                "robot_strategy_points", "imu_pitch"):
+
+    import argparse, sys, os
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--no-output", action="store_true")
+    if _ap.parse_args().no_output:
+        sys.stdout = open(os.devnull, "w")
+
+    for key in ("sim_state", "ball", "ball_lost", "robot_position", "other_robots"):
         try:
             val = mb.get(key)
             if val is not None:
