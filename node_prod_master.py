@@ -431,28 +431,22 @@ def _compute_strategy_points(ctrl, robots):
             ix, iy = _closest_on_segment(
                 crx, cry, target["x"], target["y"], sp["x"], sp["y"]
             )
-            ix, iy = _move_along_line(gx, gy, ix, iy, _MAX_RANGE)
-            ix, iy = _move_along_line(sp["x"], sp["y"], ix, iy, 2 * ROBOT_RADIUS)
-            return [{"x": round(ix, 3), "y": round(iy, 3)}]
-
-        # We are closer (or no pass target) — block both goal shot and pass lane
-        ix1, iy1 = _closest_on_segment(crx, cry, gx, gy, sp["x"], sp["y"])
-        ix1, iy1 = _move_along_line(gx, gy, ix1, iy1, _MAX_RANGE)
-        ix1, iy1 = _move_along_line(sp["x"], sp["y"], ix1, iy1, 2 * ROBOT_RADIUS)
-
-        if others:
-            target = min(others, key=lambda r: _dist(r["x"], r["y"], crx, cry))
-            ix2, iy2 = _closest_on_segment(
-                crx, cry, target["x"], target["y"], sp["x"], sp["y"]
-            )
-            ix2, iy2 = _move_along_line(gx, gy, ix2, iy2, _MAX_RANGE)
-            ix2, iy2 = _move_along_line(sp["x"], sp["y"], ix2, iy2, 2 * ROBOT_RADIUS)
+            ix, iy = _move_along_line(crx, cry, ix, iy, 2 * ROBOT_RADIUS)
+            ix, iy = _move_along_line(target["x"], target["y"], ix, iy, 2 * ROBOT_RADIUS)
             return [
-                {"x": round(ix1, 3), "y": round(iy1, 3)},
-                {"x": round(ix2, 3), "y": round(iy2, 3)},
+                {"x": round(ix, 3), "y": round(iy, 3)}, 
+                {"x": round(crx, 3), "y": round(cry, 3)}
             ]
 
-        return [{"x": round(ix1, 3), "y": round(iy1, 3)}]
+        # We are closer (or no pass target) — block goal shot
+        ix1, iy1 = _closest_on_segment(crx, cry, gx, gy, sp["x"], sp["y"])
+        ix1, iy1 = _move_along_line(gx, gy, ix1, iy1, _MAX_RANGE)
+        ix1, iy1 = _move_along_line(crx, cry, ix1, iy1, 2 * ROBOT_RADIUS)
+
+        return [
+            {"x": round(ix1, 3), "y": round(iy1, 3)},
+            {"x": round(crx, 3), "y": round(cry, 3)},
+        ]
 
     return []
 
