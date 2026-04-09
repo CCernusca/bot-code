@@ -10,6 +10,18 @@ from robus_core.libs.lib_telemtrybroker import TelemetryBroker
 from utils.perf_monitor import PerfMonitor
 from utils.cooperation_reader import SPICooperationReader, SimCooperationReader
 
+# ── GPIO (optional — Raspberry Pi only) ──────────────────────────────────────
+_GPIO_PIN = 17
+try:
+    import RPi.GPIO as _GPIO
+    _gpio_available = True
+except ImportError:
+    _gpio_available = False
+
+# Set when GPIO 17 goes HIGH or the first frame is received from the ally.
+# _send_loop blocks until this event is set.
+_ready_to_send = threading.Event()
+
 # ── Reader factory ────────────────────────────────────────────────────────────
 # To swap the transport layer, return a different BaseCooperationReader here.
 COOP_SIM_REPLACE = True
@@ -210,11 +222,13 @@ def _process_frame(data):
 
 
 def on_frame(data):
+    _ready_to_send.set()
     with _perf.measure("hw_extract"):
         _process_frame(data)
 
 
 def on_sim_frame(data):
+    _ready_to_send.set()
     with _perf.measure("sim_extract"):
         _process_frame(data)
 
@@ -287,7 +301,13 @@ def _build_outgoing_frame():
 
 
 def _send_loop(reader_ref):
-    """Periodically transmit our robot's state at 20 Hz (every 50 ms)."""
+    """Periodically transmit our robot's state at 20 Hz (every 50 ms).
+
+    Blocks until _ready_to_send is set — triggered by GPIO 17 going HIGH
+    or by the first incoming frame from the ally.
+    """
+    _ready_to_send.wait()
+    print("[COOP] Ready — starting outgoing frame transmission.")
     interval = 0.05
     while True:
         frame = _build_outgoing_frame()
@@ -377,6 +397,22 @@ if __name__ == "__main__":
     frame_cb  = on_sim_frame if isinstance(reader, SimCooperationReader) else on_frame
     reader.start(frame_cb)
 
+    # ── GPIO 17 start-gate ────────────────────────────────────────────────────
+    if _gpio_available:
+        _GPIO.setmode(_GPIO.BCM)
+        _GPIO.setup(_GPIO_PIN, _GPIO.IN, pull_up_down=_GPIO.PUD_DOWN)
+        if _GPIO.input(_GPIO_PIN) == _GPIO.HIGH:
+            print(f"[COOP] GPIO {_GPIO_PIN} already HIGH — ready immediately.")
+            _ready_to_send.set()
+        else:
+            _GPIO.add_event_detect(
+                _GPIO_PIN, _GPIO.RISING,
+                callback=lambda _: _ready_to_send.set(),
+            )
+            print(f"[COOP] Waiting for GPIO {_GPIO_PIN} HIGH or first ally frame...")
+    else:
+        print("[COOP] GPIO unavailable — waiting for first ally frame...")
+
     # Mutable container so _send_loop can access the reader instance
     _reader_ref = [reader]
     threading.Thread(target=_send_loop, args=(_reader_ref,), daemon=True,
@@ -389,5 +425,7 @@ if __name__ == "__main__":
         pass
     finally:
         print("\n[COOP] Stopped.")
+        if _gpio_available:
+            _GPIO.cleanup(_GPIO_PIN)
         reader.stop()
         mb.close()
